@@ -177,7 +177,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: sync_table
           LOG_LEVEL: !Ref LogLevel
           DB_USER_SECRET_NAME: !Ref DatabaseUserSecretCanvas
-          DB_PROXY_ENDPOINT: !GetAtt DatabaseProxy.Endpoint
       Timeout: 900
       MemorySize: 2048
       VpcConfig:
@@ -207,7 +206,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: init_table
           LOG_LEVEL: !Ref LogLevel
           DB_USER_SECRET_NAME: !Ref DatabaseUserSecretCanvas
-          DB_PROXY_ENDPOINT: !GetAtt DatabaseProxy.Endpoint
       Timeout: 900
       MemorySize: 8192
       VpcConfig:
