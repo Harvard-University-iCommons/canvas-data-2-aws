@@ -22,7 +22,16 @@ This application uses an AWS Step Function to orchestrate the workflow:
    3. If executed, the output of `init_table` is checked; error handling TBD
 4. Once all iterations are complete, a notification is sent to an SNS topic
 
-## Deploy the canvas-data-2 application
+## Prerequisites
+
+It will be helpful to have a working knowledge of AWS services and the AWS Console. Before you can deploy the application you will need to have the following available:
+* A VPC
+* One or more subnets where the Lambda functions can be deployed
+* One or more subnets where the database cluster can be deployed (can be the same as the Lambda subnets)
+
+By default the database will not have a public IP address and will not be accessible outside of your VPC. You will need to configure network access to the database as appropriate for your situation.
+
+## Deploying the application
 
 The Serverless Application Model Command Line Interface (SAM CLI) is an extension of the AWS CLI that adds functionality for building and testing Lambda applications. It uses Docker to run your functions in an Amazon Linux environment that matches Lambda. It can also emulate your application's build environment and API.
 
@@ -46,10 +55,10 @@ The first command will build the source of your application. The second command 
 * **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modifies IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
 * **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
 
-## Database
+## Preparing the database
 
 Deploying this application will create an AWS Aurora Postgres cluster. A database user credential is also created and stored in AWS Secrets Manager. In order for the application to use that credential to connect to the database,
-a postgres user must be created and granted appropriate privileges. A helper script is included that will take care of this setup. After deploying the SAM app, run this script:
+a Postgresql user must be created and granted appropriate privileges. A helper script is included that will take care of this setup. After deploying the SAM app, run this script:
 ```
 ./prepare_aurora_db.py --stack-name <stack name returned by the SAM deployment>
 ```
@@ -64,6 +73,14 @@ aws ssm put-parameter --name '/<environment>/canvas_data_2/dap_client_id' --type
 aws ssm put-parameter --name '/<environment>/canvas_data_2/dap_client_secret' --type SecureString --value '<your client secret>'
 ```
 where `<environment>` is either `dev` or `prod`. You can also use the AWS SSM console to manage the parameter.
+
+## Running the application
+
+By default the workflow that synchronizes the database will run ever three hours. You can also run the workflow manually via the AWS Console: navigate to the Step Functions console, find your `CD2RefreshStateMachine` in the list, and click the `Start execution` button.
+
+This application uses AWS Lambda to run the `init` and `sync` steps for each CD2 table. If the `init` or `sync` step for any given table takes longer than 15 minutes (the limit on how long Lambda functions can run), the workflow will fail. You will be able to see the error in the AWS Step Functions console. If this happens, you'll need to perform the first initialization for the problematic table manually using the DAP client.
+
+TODO: details on how to initialize a table using the DAP client
 
 ## Cleanup
 
