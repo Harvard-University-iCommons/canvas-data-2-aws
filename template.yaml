@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform:
+  - AWS::Serverless-2016-10-31
+Description: >
+  canvas-data-2
+
+  This template contains infrastructure for maintaining a Postgresql database containing
+  data sourced from Canvas Data 2. It uses the higher-level `dap` functionality from
+  instructure to maintain the local tables.
+
+  A Step Function is used to orchestrate the synchronization operations.
+
+Parameters:
+  EnvironmentParameter:
+    Type: String
+    AllowedValues:
+      - "dev"
+      - "prod"
+    Default: "dev"
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - 'DEBUG'
+      - 'INFO'
+      - 'WARN'
+      - 'ERROR'
+
+  SkipTablesParameter:
+    Type: String
+
+  VpcIdParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Description: The ID of the VPC to deploy the database and Lambda functions into.
+
+  DatabaseSubnetListParameter:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The list of one or more subnets to deploy the database into.
+
+  LambdaSubnetListParameter:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The list of one or more subnets to deploy the Lambda functions into.
+
+Resources:
+
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting secrets
+      Enabled: true
+
+  # Create a secret for the CD2 app "canvas" user
+  DatabaseUserSecretCanvas:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub uw-cd2-db-user-${EnvironmentParameter}-canvas
+      Description: Aurora database user secret for canvas user
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "canvas"}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: ":\"'@/\\"
+      KmsKeyId: !Ref KmsKey
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub uw-cd2-subnetgroup-${EnvironmentParameter}
+      SubnetIds: !Ref DatabaseSubnetListParameter
+
+  DatabaseClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub uw-cd2-database-client-sg-${EnvironmentParameter}
+      VpcId: !Ref VpcIdParameter
+
+  EmptySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub uw-cd2-empty-sg-${EnvironmentParameter}
+      VpcId: !Ref VpcIdParameter
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub uw-cd2-database-sg-${EnvironmentParameter}
+      VpcId: !Ref VpcIdParameter
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseClientSecurityGroup
+        # TODO: add more ingress rules based on parameter(s)
+
+  AuroraDatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: 15.5
+      MasterUsername: cd2admin
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !Ref KmsKey
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+          - !Ref DatabaseSecurityGroup
+      Port: 5432
+      DatabaseName: cd2
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      DeletionProtection: false
+      EnableHttpEndpoint: true
+      BackupRetentionPeriod: 7
+      StorageEncrypted: true
+
+  # Attach Canvas database user Secret to the cluster
+  DatabaseUserSecretAttachmentCanvas:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DatabaseUserSecretCanvas
+      TargetId: !Ref AuroraDatabaseCluster
+      TargetType: AWS::RDS::DBCluster
+
+  AuroraDatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraDatabaseCluster
+
+  ListTablesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: list_tables/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub '${EnvironmentParameter}/canvas_data_2*'
+      Environment:
+        Variables:
+          ENV: !Ref EnvironmentParameter
+          POWERTOOLS_METRICS_NAMESPACE: canvas-data-2
+          POWERTOOLS_SERVICE_NAME: list_tables
+          LOG_LEVEL: !Ref LogLevel
+          SKIP_TABLES: !Ref SkipTablesParameter
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref EmptySecurityGroup
+        SubnetIds: !Ref LambdaSubnetListParameter
+
+  SyncTableFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: sync_table/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub '${EnvironmentParameter}/canvas_data_2*'
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DatabaseUserSecretCanvas
+        - KMSDecryptPolicy:
+            KeyId: !Ref KmsKey
+      Environment:
+        Variables:
+          ENV: !Ref EnvironmentParameter
+          POWERTOOLS_METRICS_NAMESPACE: canvas-data-2
+          POWERTOOLS_SERVICE_NAME: sync_table
+          LOG_LEVEL: !Ref LogLevel
+          DB_USER_SECRET_NAME: !Ref DatabaseUserSecretCanvas
+          DB_PROXY_ENDPOINT: !GetAtt DatabaseProxy.Endpoint
+      Timeout: 900
+      MemorySize: 2048
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DatabaseClientSecurityGroup
+        SubnetIds: !Ref LambdaSubnetListParameter
+
+  InitTableFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: init_table/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub '${EnvironmentParameter}/canvas_data_2*'
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DatabaseUserSecretCanvas
+        - KMSDecryptPolicy:
+            KeyId: !Ref KmsKey
+      Environment:
+        Variables:
+          ENV: !Ref EnvironmentParameter
+          POWERTOOLS_METRICS_NAMESPACE: canvas-data-2
+          POWERTOOLS_SERVICE_NAME: init_table
+          LOG_LEVEL: !Ref LogLevel
+          DB_USER_SECRET_NAME: !Ref DatabaseUserSecretCanvas
+          DB_PROXY_ENDPOINT: !GetAtt DatabaseProxy.Endpoint
+      Timeout: 900
+      MemorySize: 8192
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DatabaseClientSecurityGroup
+        SubnetIds: !Ref LambdaSubnetListParameter
+
+  WorkflowNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "Canvas Data 2 Synchronization Workflow (${EnvironmentParameter})"
+
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "${ListTablesFunction.Arn}*"
+                  - !Sub "${SyncTableFunction.Arn}*"
+                  - !Sub "${InitTableFunction.Arn}*"
+        - PolicyName: NotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref WorkflowNotificationTopic
+
+  CD2RefreshStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Role: !GetAtt StatesExecutionRole.Arn
+      Events:
+        ThreeHourlySchedule:
+          Type: ScheduleV2
+          Properties:
+            Description: Execute the Canvas Data 2 Step Function every 3 hours
+            FlexibleTimeWindow:
+              Mode: FLEXIBLE
+              MaximumWindowInMinutes: 10
+            ScheduleExpression: rate(3 hours)
+            State: ENABLED
+      Definition:
+        StartAt: ListTables
+        States:
+          ListTables:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            OutputPath: "$.Payload"
+            Parameters:
+              Payload.$: "$"
+              FunctionName: !Ref ListTablesFunction
+            Retry:
+              - ErrorEquals:
+                 - Lambda.ServiceException
+                 - Lambda.AWSLambdaException
+                 - Lambda.SdkClientException
+                 - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 6
+                BackoffRate: 6
+            Next: ProcessTables
+          ProcessTables:
+            Type: Map
+            MaxConcurrency: 30
+            ItemsPath: "$.tables"
+            Next: SendNotification
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: SyncTable
+              States:
+                SyncTable:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters:
+                    Payload.$: "$"
+                    FunctionName: !Ref SyncTableFunction
+                  Retry:
+                    - ErrorEquals:
+                      - Lambda.ServiceException
+                      - Lambda.AWSLambdaException
+                      - Lambda.SdkClientException
+                      - Lambda.TooManyRequestsException
+                      IntervalSeconds: 2
+                      MaxAttempts: 6
+                      BackoffRate: 6
+                  Next: CheckSyncState
+                CheckSyncState:
+                  Type: Choice
+                  Choices:
+                    - Variable: "$.Payload.state"
+                      StringEquals: needs_init
+                      Next: InitTable
+                  Default: TableComplete
+                InitTable:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters:
+                    Payload.$: "$.Payload"
+                    FunctionName: !Ref InitTableFunction
+                  Retry:
+                    - ErrorEquals:
+                      - Lambda.ServiceException
+                      - Lambda.AWSLambdaException
+                      - Lambda.SdkClientException
+                      - Lambda.TooManyRequestsException
+                      IntervalSeconds: 2
+                      MaxAttempts: 6
+                      BackoffRate: 6
+                  Next: CheckInitState
+                CheckInitState:
+                  Type: Choice
+                  Choices:
+                    - Variable: "$.Payload.state"
+                      StringEquals: failed
+                      Next: Pass
+                  Default: TableComplete
+                Pass:
+                  Type: Pass
+                  OutputPath: "$.Payload"
+                  End: true
+                TableComplete:
+                  Type: Succeed
+                  OutputPath: "$.Payload"
+          SendNotification:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              Message.$: "$"
+              TopicArn: !Ref WorkflowNotificationTopic
+            End: true
+
+Outputs:
+  AdminSecretArn:
+    Value: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
+    Description: The ARN of the Aurora admin user secret
+    Export:
+      Name: !Sub uw-cd2-aurora-admin-secret-arn-${EnvironmentParameter}
+  AuroraClusterArn:
+    Value: !GetAtt AuroraDatabaseCluster.DBClusterArn
+    Description: The ARN of the Aurora cluster
+    Export:
+      Name: !Sub uw-cd2-aurora-cluster-arn-${EnvironmentParameter}

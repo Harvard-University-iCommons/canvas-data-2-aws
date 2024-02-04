@@ -1,0 +1,27 @@
+version = 0.1
+
+[dev]
+[dev.deploy]
+[dev.deploy.parameters]
+stack_name = "uw-canvas-data-2-dev"
+s3_prefix = "uw-canvas-data-2-dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "EnvironmentParameter=\"dev\" LogLevel=\"DEBUG\" SkipTablesParameter=\"\""
+image_repositories = []
+tags = "environment=\"dev\""
+resolve_s3 = true
+
+[prod]
+[prod.deploy]
+[prod.deploy.parameters]
+stack_name = "uw-canvas-data-2-prod"
+s3_prefix = "uw-canvas-data-2-prod"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "EnvironmentParameter=\"prod\" LogLevel=\"INFO\" SkipTablesParameter=\"\""
+image_repositories = []
+tags = "environment=\"prod\""
+resolve_s3 = true
