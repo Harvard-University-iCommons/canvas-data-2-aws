@@ -3,8 +3,8 @@ version = 0.1
 [dev]
 [dev.deploy]
 [dev.deploy.parameters]
-stack_name = "uw-canvas-data-2-dev"
-s3_prefix = "uw-canvas-data-2-dev"
+stack_name = "canvas-data-2-dev"
+s3_prefix = "canvas-data-2-dev"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
@@ -16,8 +16,8 @@ resolve_s3 = true
 [prod]
 [prod.deploy]
 [prod.deploy.parameters]
-stack_name = "uw-canvas-data-2-prod"
-s3_prefix = "uw-canvas-data-2-prod"
+stack_name = "canvas-data-2-prod"
+s3_prefix = "canvas-data-2-prod"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
