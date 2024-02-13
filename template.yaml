@@ -290,7 +290,7 @@ Resources:
             Type: Map
             MaxConcurrency: 30
             ItemsPath: "$.tables"
-            Next: SendNotification
+            Next: PivotResults
             ItemProcessor:
               ProcessorConfig:
                 Mode: INLINE
@@ -340,15 +340,23 @@ Resources:
                   Choices:
                     - Variable: "$.Payload.state"
                       StringEquals: failed
-                      Next: Pass
+                      Next: TableFailed
                   Default: TableComplete
-                Pass:
+                TableFailed:
                   Type: Pass
                   OutputPath: "$.Payload"
                   End: true
                 TableComplete:
                   Type: Succeed
                   OutputPath: "$.Payload"
+          PivotResults:
+            Type: Pass
+            Next: SendNotification
+            Parameters:
+              - failed.$: "$[?(@.state==failed)].table_name"
+              - complete.$: "$[?(@.state==complete)].table_name"
+              - num_failed.$: "States.ArrayLength($[?(@.state==failed)].table_name)"
+              - num_complete.$: "States.ArrayLength($[?(@.state==complete)].table_name)"
           SendNotification:
             Type: Task
             Resource: arn:aws:states:::sns:publish
