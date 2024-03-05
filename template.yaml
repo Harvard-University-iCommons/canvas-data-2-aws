@@ -168,8 +168,16 @@ Resources:
             ParameterName: !Sub '${EnvironmentParameter}/canvas_data_2*'
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref DatabaseUserSecretCanvas
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
         - KMSDecryptPolicy:
             KeyId: !Ref KmsKey
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds-data:*
+              Resource: !GetAtt AuroraDatabaseCluster.DBClusterArn
       Environment:
         Variables:
           ENV: !Ref EnvironmentParameter
@@ -177,6 +185,9 @@ Resources:
           POWERTOOLS_SERVICE_NAME: sync_table
           LOG_LEVEL: !Ref LogLevel
           DB_USER_SECRET_NAME: !Ref DatabaseUserSecretCanvas
+          ADMIN_SECRET_ARN: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
+          DB_CLUSTER_ARN: !GetAtt AuroraDatabaseCluster.DBClusterArn
+
       Timeout: 900
       MemorySize: 2048
       VpcConfig:
@@ -311,6 +322,11 @@ Resources:
                       IntervalSeconds: 2
                       MaxAttempts: 6
                       BackoffRate: 6
+                  Catch:
+                    - ErrorEquals:
+                      - States.TaskFailed
+                      ResultPath: "$.error"
+                      Next: TableFailed
                   Next: CheckSyncState
                 CheckSyncState:
                   Type: Choice
@@ -334,7 +350,12 @@ Resources:
                       IntervalSeconds: 2
                       MaxAttempts: 6
                       BackoffRate: 6
-                  Next: CheckInitState
+                   Catch:
+                    - ErrorEquals:
+                      - States.TaskFailed
+                      ResultPath: "$.error"
+                      Next: TableFailed
+                 Next: CheckInitState
                 CheckInitState:
                   Type: Choice
                   Choices:
@@ -353,9 +374,13 @@ Resources:
             Type: Pass
             Next: SendNotification
             Parameters:
-              - failed.$: "$[?(@.state==failed)].table_name"
+              - failed.$: "$[?(@.state==failed || @.state==needs_init || @.state==needs_sync)].table_name"
+              - failed_init.$: "$[?(@.state==needs_init)].table_name"
+              - failed_sync.$: "$[?(@.state==needs_sync)].table_name"
+              - complete_with_update.$: "$[?(@.state==complete_with_update)].table_name"
               - complete.$: "$[?(@.state==complete)].table_name"
-              - num_failed.$: "States.ArrayLength($[?(@.state==failed)].table_name)"
+              - num_failed.$: "States.ArrayLength($[?(@.state==failed || @.state==needs_init || @.state==needs_sync)].table_name)"
+              - num_complete_with_update.$: "States.ArrayLength($[?(@.state==complete_with_update)].table_name)"
               - num_complete.$: "States.ArrayLength($[?(@.state==complete)].table_name)"
           SendNotification:
             Type: Task

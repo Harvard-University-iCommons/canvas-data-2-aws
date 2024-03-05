@@ -1,14 +1,14 @@
 import asyncio
 import os
-from urllib.parse import quote_plus
 
 from aws_lambda_powertools import Logger
 from aws_lambda_powertools.utilities import parameters
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from botocore.config import Config
 from dap.dap_types import Credentials
-from dap.actions.init_db import init_db
-import dap.plugins
+from dap.integration.database import DatabaseConnection
+from dap.api import DAPClient
+from dap.replicator.sql import SQLReplicator
 
 region = os.environ.get('AWS_REGION')
 
@@ -26,8 +26,6 @@ api_base_url = os.environ.get('API_BASE_URL', 'https://api-gateway.instructure.c
 
 namespace = 'canvas'
 
-dap.plugins.load()
-
 
 def lambda_handler(event, context: LambdaContext):
     params = ssm_provider.get_multiple(param_path, max_age=600, decrypt=True)
@@ -43,6 +41,7 @@ def lambda_handler(event, context: LambdaContext):
     db_port = db_user_secret['port']
 
     conn_str = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    db_connection = DatabaseConnection(connection_string=conn_str)
 
     credentials = Credentials.create(client_id=dap_client_id, client_secret=dap_client_secret)
 
@@ -54,13 +53,7 @@ def lambda_handler(event, context: LambdaContext):
 
     try:
         asyncio.get_event_loop().run_until_complete(
-            init_db(
-                base_url=api_base_url,
-                namespace=namespace,
-                table_name=table_name,
-                credentials=credentials,
-                connection_string=conn_str,
-            )
+            init_table(credentials, api_base_url, db_connection, namespace, table_name)
         )
 
         event['state'] = 'complete'
@@ -71,3 +64,8 @@ def lambda_handler(event, context: LambdaContext):
     logger.info(f"event: {event}")
 
     return event
+
+
+async def init_table(credentials, api_base_url, db_connection, namespace, table_name):
+    async with DAPClient(api_base_url, credentials) as session:
+        await SQLReplicator(session, db_connection).initialize(namespace, table_name)

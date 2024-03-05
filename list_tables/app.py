@@ -42,7 +42,7 @@ def lambda_handler(event, context: LambdaContext):
     # we can skip certain tables if necessary by setting an environment variable (comma-separated list)
     skip_tables = os.environ.get('SKIP_TABLES', '').split(',')
 
-    tmap = list(map(lambda t: {'table_name': t}, [t for t in tables if t not in skip_tables]))
+    tmap = list(map(lambda t: {'table_name': t, "state": "needs_sync"}, [t for t in tables if t not in skip_tables]))
 
     return {'tables': tmap}
 

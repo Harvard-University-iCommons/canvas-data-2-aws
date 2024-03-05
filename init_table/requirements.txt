@@ -1,2 +1,4 @@
-aws-lambda-powertools==2.30.1
-instructure-dap-client==0.3.18
+aws-lambda-powertools==2.34.2
+# temporary until new version is released:
+pysqlsync @ https://github.com/hunyadi/pysqlsync/archive/refs/heads/dev.zip
+instructure-dap-client[postgresql]==1.0.0
