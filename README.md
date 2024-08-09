@@ -28,6 +28,7 @@ It will be helpful to have a working knowledge of AWS services and the AWS Conso
 * A VPC
 * One or more subnets where the Lambda functions can be deployed
 * One or more subnets where the database cluster can be deployed (can be the same as the Lambda subnets)
+* VPC attached Lambda will need access to the SSM via VPC endpoint [VPC endpoints for Systems Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-create-vpc.html#sysman-setting-up-vpc-create)
 
 By default the database will not have a public IP address and will not be accessible outside of your VPC. You will need to configure network access to the database as appropriate for your situation.
 
