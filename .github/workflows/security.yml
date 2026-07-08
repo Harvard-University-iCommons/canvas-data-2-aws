@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   iac-scan:
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
     name: Falcon IaC & Secrets Scan
     runs-on: ubuntu-latest
     steps:
@@ -109,6 +110,7 @@ jobs:
           path: fcs-iac-comment.md
 
   image-scan:
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
     name: Falcon Image Scan - ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
