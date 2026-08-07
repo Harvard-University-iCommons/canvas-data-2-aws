@@ -171,6 +171,15 @@ Resources:
       Engine: aurora-postgresql
       DBInstanceClass: db.serverless
       DBClusterIdentifier: !Ref AuroraDatabaseCluster
+      # The default depends on the subnet configuration, so state it explicitly:
+      # nothing outside the VPC should be able to reach this database.
+      PubliclyAccessible: false
+      # EngineVersionParameter pins an exact version. Letting AWS apply minor
+      # upgrades in the background would silently diverge from it, so upgrades
+      # are a deliberate act here: bump the parameter and redeploy. If you would
+      # rather have patches applied automatically, set this to true and expect
+      # the deployed version to drift ahead of the template.
+      AutoMinorVersionUpgrade: false
 
   # Log groups are declared explicitly so that retention is bounded. Lambda's
   # implicit log groups never expire. The names must stay under /aws/lambda/ so
