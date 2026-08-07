@@ -51,6 +51,9 @@ endpoint can reach. Once you have one, the Secrets Manager and SSM interface end
 optional — they only keep that traffic off the public internet. Without egress, the functions
 will simply time out.
 
+The functions also have X-Ray tracing enabled, which needs the same outbound access (or an
+X-Ray VPC endpoint).
+
 By default the database will not have a public IP address and will not be accessible outside of your VPC. You will need to configure network access to the database as appropriate for your situation.
 
 ## Deploying the application
@@ -91,14 +94,34 @@ The first command will build the source of your application. The second command 
 * **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modifies IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
 * **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
 
-The template also takes an `EngineVersionParameter` (default `15.5`) controlling the Aurora PostgreSQL
-engine version. AWS retires pinned minor versions over time, so if stack creation fails complaining
-about the engine version, pick a currently available one:
+### Template parameters
+
+Beyond the VPC and subnet parameters, the template takes:
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `EngineVersionParameter` | `15.5` | Aurora PostgreSQL engine version |
+| `MapMaxConcurrencyParameter` | `10` | How many tables to sync concurrently |
+| `DatabaseMinCapacityParameter` | `0.5` | Minimum Aurora Serverless v2 capacity (ACU) |
+| `DatabaseMaxCapacityParameter` | `4` | Maximum Aurora Serverless v2 capacity (ACU) |
+| `LogRetentionInDaysParameter` | `30` | CloudWatch log retention |
+| `SkipTablesParameter` | — | Comma-separated list of tables to skip |
+
+AWS retires pinned Aurora minor versions over time, so if stack creation fails complaining about
+the engine version, pick a currently available one:
 
 ```bash
 aws rds describe-db-engine-versions --engine aurora-postgresql \
   --query 'DBEngineVersions[].EngineVersion' --output text
 ```
+
+**Concurrency and database capacity are linked.** Each concurrent table sync opens its own
+connection, and Aurora Serverless v2 scales `max_connections` with ACU capacity. The defaults are
+deliberately conservative because the first run is the heaviest — every table needs to be
+initialized at once against a cluster sitting at its minimum capacity. If you see connection
+errors, either lower `MapMaxConcurrencyParameter` or raise `DatabaseMinCapacityParameter`. Note
+that raising the minimum capacity raises your continuous cost, since it is the floor you pay for
+whether or not the workflow is running.
 
 ## Preparing the database
 
@@ -110,6 +133,21 @@ a Postgresql user must be created and granted appropriate privileges. A helper s
 Occasionally the schema for a CD2 table will change. The DAP library applies these changes automatically with `ALTER TABLE`, and this application does nothing special to accommodate them.
 
 Note that PostgreSQL refuses to `ALTER TABLE` while a view depends on the table. This application creates no views, so it should not come up — but if you add your own views over the replicated tables, a CD2 schema change will start failing. `sync_table` reports that case as `needs_ddl_update` and the table is listed under `failed_ddl_update` in the SNS notification; you would need to drop the dependent views and re-run the workflow. If you want that handled automatically, the `deps_save_and_drop_dependencies` / `deps_restore_dependencies` functions from https://github.com/rvkulikov/pg-deps-management are one way to do it.
+
+## Monitoring
+
+The workflow publishes a summary to the `WorkflowNotificationTopic` SNS topic at the end of every
+run, listing which tables completed and which failed. Subscribe to that topic to receive them.
+
+Because that notification is sent on every run whether or not anything went wrong, a CloudWatch
+alarm (`cd2-<environment>-workflow-failed`) also publishes to the same topic when a Step Functions
+execution actually fails, so real failures are distinguishable from the routine summaries.
+
+Step Functions execution history is logged to `/aws/vendedlogs/states/cd2-<environment>-refresh`,
+and each Lambda function logs to `/aws/lambda/cd2-<environment>-<function>`. All of these use the
+retention set by `LogRetentionInDaysParameter`; note that Lambda's default log groups never expire,
+which is why the template declares them explicitly. X-Ray tracing is enabled on the functions and
+the state machine.
 
 ## Configuration
 
