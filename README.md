@@ -33,7 +33,23 @@ It will be helpful to have a working knowledge of AWS services and the AWS Conso
 * A VPC
 * One or more subnets where the Lambda functions can be deployed
 * One or more subnets where the database cluster can be deployed (can be the same as the Lambda subnets)
-* VPC attached Lambda will need access to the SSM via VPC endpoint [VPC endpoints for Systems Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-create-vpc.html#sysman-setting-up-vpc-create)
+* **Outbound internet access from the Lambda subnets** — see below
+
+### Network access for the Lambda functions
+
+The Lambda functions are attached to your VPC so that they can reach the database, and a
+VPC-attached Lambda has no internet access by default. The functions need to reach three things:
+
+| Destination | Why | How to provide it |
+| --- | --- | --- |
+| `api-gateway.instructure.com` | The DAP API — where the data comes from | **NAT gateway (or equivalent egress).** There is no VPC endpoint for a third-party service. |
+| AWS Secrets Manager | Reading the database user credential | NAT gateway, or a [Secrets Manager interface endpoint](https://docs.aws.amazon.com/secretsmanager/latest/userguide/vpc-endpoint-overview.html) |
+| AWS SSM Parameter Store | Reading the DAP client ID and secret | NAT gateway, or [VPC endpoints for Systems Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-create-vpc.html#sysman-setting-up-vpc-create) |
+
+**A NAT gateway is effectively required**, because the DAP API is a public endpoint that no VPC
+endpoint can reach. Once you have one, the Secrets Manager and SSM interface endpoints become
+optional — they only keep that traffic off the public internet. Without egress, the functions
+will simply time out.
 
 By default the database will not have a public IP address and will not be accessible outside of your VPC. You will need to configure network access to the database as appropriate for your situation.
 
