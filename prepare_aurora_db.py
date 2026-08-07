@@ -50,7 +50,7 @@ env = stack_parameters["EnvironmentParameter"]
 
 
 # get the database user secrets
-secret_name_prefix = f"uw-cd2-db-user-{env}-"
+secret_name_prefix = f"cd2-db-user-{env}-"
 user_secrets = secrets_client.list_secrets(
     Filters=[{"Key": "name", "Values": [secret_name_prefix]}],
     MaxResults=100,

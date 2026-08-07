@@ -63,7 +63,7 @@ Resources:
   DatabaseUserSecretCanvas:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub uw-cd2-db-user-${EnvironmentParameter}-canvas
+      Name: !Sub cd2-db-user-${EnvironmentParameter}-canvas
       Description: Aurora database user secret for canvas user
       GenerateSecretString:
         SecretStringTemplate: '{"username": "canvas"}'
@@ -75,25 +75,25 @@ Resources:
   DatabaseSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: !Sub uw-cd2-subnetgroup-${EnvironmentParameter}
+      DBSubnetGroupDescription: !Sub cd2-subnetgroup-${EnvironmentParameter}
       SubnetIds: !Ref DatabaseSubnetListParameter
 
   DatabaseClientSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub uw-cd2-database-client-sg-${EnvironmentParameter}
+      GroupDescription: !Sub cd2-database-client-sg-${EnvironmentParameter}
       VpcId: !Ref VpcIdParameter
 
   EmptySecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub uw-cd2-empty-sg-${EnvironmentParameter}
+      GroupDescription: !Sub cd2-empty-sg-${EnvironmentParameter}
       VpcId: !Ref VpcIdParameter
 
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub uw-cd2-database-sg-${EnvironmentParameter}
+      GroupDescription: !Sub cd2-database-sg-${EnvironmentParameter}
       VpcId: !Ref VpcIdParameter
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -403,9 +403,9 @@ Outputs:
     Value: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
     Description: The ARN of the Aurora admin user secret
     Export:
-      Name: !Sub uw-cd2-aurora-admin-secret-arn-${EnvironmentParameter}
+      Name: !Sub cd2-aurora-admin-secret-arn-${EnvironmentParameter}
   AuroraClusterArn:
     Value: !GetAtt AuroraDatabaseCluster.DBClusterArn
     Description: The ARN of the Aurora cluster
     Export:
-      Name: !Sub uw-cd2-aurora-cluster-arn-${EnvironmentParameter}
+      Name: !Sub cd2-aurora-cluster-arn-${EnvironmentParameter}
