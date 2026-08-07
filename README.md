@@ -100,7 +100,7 @@ Beyond the VPC and subnet parameters, the template takes:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `EngineVersionParameter` | `15.5` | Aurora PostgreSQL engine version |
+| `EngineVersionParameter` | `16.14` | Aurora PostgreSQL engine version |
 | `MapMaxConcurrencyParameter` | `10` | How many tables to sync concurrently |
 | `DatabaseMinCapacityParameter` | `0.5` | Minimum Aurora Serverless v2 capacity (ACU) |
 | `DatabaseMaxCapacityParameter` | `4` | Maximum Aurora Serverless v2 capacity (ACU) |

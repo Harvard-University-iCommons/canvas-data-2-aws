@@ -32,7 +32,7 @@ Parameters:
 
   EngineVersionParameter:
     Type: String
-    Default: "15.5"
+    Default: "16.14"
     Description: >
       The Aurora PostgreSQL engine version to deploy. Pinned minor versions are
       retired by AWS over time; if the stack fails to create, check
