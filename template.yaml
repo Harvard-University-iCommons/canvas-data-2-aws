@@ -30,6 +30,15 @@ Parameters:
   SkipTablesParameter:
     Type: String
 
+  EngineVersionParameter:
+    Type: String
+    Default: "15.5"
+    Description: >
+      The Aurora PostgreSQL engine version to deploy. Pinned minor versions are
+      retired by AWS over time; if the stack fails to create, check
+      `aws rds describe-db-engine-versions --engine aurora-postgresql` for a
+      currently available version.
+
   VpcIdParameter:
     Type: AWS::EC2::VPC::Id
     Description: The ID of the VPC to deploy the database and Lambda functions into.
@@ -97,7 +106,7 @@ Resources:
     Type: AWS::RDS::DBCluster
     Properties:
       Engine: aurora-postgresql
-      EngineVersion: 15.5
+      EngineVersion: !Ref EngineVersionParameter
       MasterUsername: cd2admin
       ManageMasterUserPassword: true
       MasterUserSecret:
@@ -135,7 +144,7 @@ Resources:
     Properties:
       CodeUri: list_tables/
       Handler: app.lambda_handler
-      Runtime: python3.11
+      Runtime: python3.13
       Architectures:
         - x86_64
       Policies:
@@ -160,7 +169,10 @@ Resources:
     Properties:
       CodeUri: sync_table/
       Handler: app.lambda_handler
-      Runtime: python3.11
+      Runtime: python3.13
+      # the dap client streams TSV downloads to disk before loading them
+      EphemeralStorage:
+        Size: 1024
       Architectures:
         - x86_64
       Policies:
@@ -168,16 +180,8 @@ Resources:
             ParameterName: !Sub '${EnvironmentParameter}/canvas_data_2*'
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref DatabaseUserSecretCanvas
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
         - KMSDecryptPolicy:
             KeyId: !Ref KmsKey
-        - Version: '2012-10-17'
-          Statement:
-            - Effect: Allow
-              Action:
-                - rds-data:*
-              Resource: !GetAtt AuroraDatabaseCluster.DBClusterArn
       Environment:
         Variables:
           ENV: !Ref EnvironmentParameter
@@ -185,9 +189,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: sync_table
           LOG_LEVEL: !Ref LogLevel
           DB_USER_SECRET_NAME: !Ref DatabaseUserSecretCanvas
-          ADMIN_SECRET_ARN: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
-          DB_CLUSTER_ARN: !GetAtt AuroraDatabaseCluster.DBClusterArn
-
       Timeout: 900
       MemorySize: 2048
       VpcConfig:
@@ -200,7 +201,10 @@ Resources:
     Properties:
       CodeUri: init_table/
       Handler: app.lambda_handler
-      Runtime: python3.11
+      Runtime: python3.13
+      # a full table snapshot is larger than an incremental sync
+      EphemeralStorage:
+        Size: 2048
       Architectures:
         - x86_64
       Policies:
@@ -334,6 +338,11 @@ Resources:
                     - Variable: "$.Payload.state"
                       StringEquals: needs_init
                       Next: InitTable
+                    # no views are created against these tables, so this should not
+                    # happen; surface it as a failure rather than silently passing
+                    - Variable: "$.Payload.state"
+                      StringEquals: needs_ddl_update
+                      Next: TableFailed
                   Default: TableComplete
                 InitTable:
                   Type: Task
@@ -374,13 +383,12 @@ Resources:
             Type: Pass
             Next: SendNotification
             Parameters:
-              - failed.$: "$[?(@.state==failed || @.state==needs_init || @.state==needs_sync)].table_name"
+              - failed.$: "$[?(@.state==failed || @.state==needs_init || @.state==needs_sync || @.state==needs_ddl_update)].table_name"
               - failed_init.$: "$[?(@.state==needs_init)].table_name"
               - failed_sync.$: "$[?(@.state==needs_sync)].table_name"
-              - complete_with_update.$: "$[?(@.state==complete_with_update)].table_name"
+              - failed_ddl_update.$: "$[?(@.state==needs_ddl_update)].table_name"
               - complete.$: "$[?(@.state==complete)].table_name"
-              - num_failed.$: "States.ArrayLength($[?(@.state==failed || @.state==needs_init || @.state==needs_sync)].table_name)"
-              - num_complete_with_update.$: "States.ArrayLength($[?(@.state==complete_with_update)].table_name)"
+              - num_failed.$: "States.ArrayLength($[?(@.state==failed || @.state==needs_init || @.state==needs_sync || @.state==needs_ddl_update)].table_name)"
               - num_complete.$: "States.ArrayLength($[?(@.state==complete)].table_name)"
           SendNotification:
             Type: Task

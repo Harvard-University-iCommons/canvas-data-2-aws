@@ -31,13 +31,16 @@ def lambda_handler(event, context: LambdaContext):
     dap_client_id = params['dap_client_id']
     dap_client_secret = params['dap_client_secret']
 
-    logger.info(f"dap_client_id: {dap_client_id}")
-
     credentials = Credentials.create(client_id=dap_client_id, client_secret=dap_client_secret)
 
     os.chdir("/tmp/")
 
-    tables = asyncio.get_event_loop().run_until_complete(async_get_tables(api_base_url, credentials, namespace))
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        tables = loop.run_until_complete(async_get_tables(api_base_url, credentials, namespace))
+    finally:
+        loop.close()
 
     # we can skip certain tables if necessary by setting an environment variable (comma-separated list)
     skip_tables = os.environ.get('SKIP_TABLES', '').split(',')

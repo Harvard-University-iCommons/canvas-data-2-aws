@@ -8,6 +8,11 @@ You can deploy this application to your AWS account with the SAM CLI. It include
 - `init_table` - Code for a Lambda function that inits a table using the `dap` client library.
 - `template.yaml` - A template that defines the application's AWS resources.
 
+This application targets version 2.x of the `instructure-dap-client` library. Version 2 changed the
+client API in ways that are not backward compatible with 1.x, so the Lambda functions here follow the
+same call sequence the `dap` CLI itself uses (`version_upgrade()` followed by
+`execute_operation_on_tables()`), and handle the `ExceptionGroup`s that the 2.x client raises.
+
 This application uses an AWS Step Function to orchestrate the workflow:
 
 ![workflow diagram](canvas-data-2-step-function.png)
@@ -17,10 +22,10 @@ This application uses an AWS Step Function to orchestrate the workflow:
 1. The Step Function is executed on an hourly schedule via EventBridge.
 2. The first step executes the `list_tables` Lambda functions which retrieves the list of CD2 tables from the API.
 3. The list of tables is passed to a `Map` step which executes the following steps for each item in the list:
-   1. The `sync_table` Lambda function is executed. This returns either `success` or `init_needed` (if the table doesn't exist in the database yet).
-   2. The output of `sync_table` is checked: if the table successfully synced, the iteration is complete. If `init_needed` was returned, the `init_table` function is executed.
-   3. If executed, the output of `init_table` is checked; error handling TBD
-4. Once all iterations are complete, a notification is sent to an SNS topic
+   1. The `sync_table` Lambda function is executed. It returns one of `complete`, `needs_init` (the table doesn't exist in the database yet), `needs_ddl_update` (a schema change could not be applied), or `failed`.
+   2. The output of `sync_table` is checked. If the table synced, the iteration is complete. If `needs_init` was returned, the `init_table` function is executed. Anything else ends the iteration as a failure.
+   3. If executed, the output of `init_table` is checked; `failed` ends the iteration as a failure, anything else as a success.
+4. Once all iterations are complete, a notification is sent to an SNS topic summarizing which tables completed and which failed.
 
 ## Prerequisites
 
@@ -40,6 +45,20 @@ To use the SAM CLI to deploy this application, you need the following tools.
 
 * SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
 * [Python 3 installed](https://www.python.org/downloads/)
+* [Docker](https://docs.docker.com/get-docker/) - required, see below
+
+Docker is required because these functions depend on packages with compiled C extensions
+(`asyncpg`, `tsv2py`, `aiohttp`). A plain `sam build` installs wheels built for *your* machine,
+which produces a deployment package that fails at runtime whenever your platform differs from the
+Lambda runtime. `samconfig.toml` therefore sets `use_container = true`, so `sam build` compiles
+inside the Lambda-matching container image. If you invoke `sam build` without the config file,
+pass `--use-container` explicitly.
+
+The functions are configured for `x86_64`. You can switch them to `arm64` (cheaper and faster on
+Graviton) by changing the three `Architectures` entries in `template.yaml`; note that `tsv2py`
+publishes no `linux-aarch64` wheels as of 0.8.0, so an arm64 build compiles it from source and
+takes longer. Building for an architecture that differs from your host works but runs under
+emulation, which is slow.
 
 To build and deploy your application for the first time, run the following in your shell:
 
@@ -56,6 +75,15 @@ The first command will build the source of your application. The second command 
 * **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modifies IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
 * **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
 
+The template also takes an `EngineVersionParameter` (default `15.5`) controlling the Aurora PostgreSQL
+engine version. AWS retires pinned minor versions over time, so if stack creation fails complaining
+about the engine version, pick a currently available one:
+
+```bash
+aws rds describe-db-engine-versions --engine aurora-postgresql \
+  --query 'DBEngineVersions[].EngineVersion' --output text
+```
+
 ## Preparing the database
 
 Deploying this application will create an AWS Aurora Postgres cluster. A database user credential is also created and stored in AWS Secrets Manager. In order for the application to use that credential to connect to the database,
@@ -63,7 +91,9 @@ a Postgresql user must be created and granted appropriate privileges. A helper s
 ```
 ./prepare_aurora_db.py --stack-name <stack name returned by the SAM deployment>
 ```
-Occasionally the schema for a CD2 table will change. The DAP library will take care of applying these changes to the database, but they will not succeed if you have created views that depend on the table. To handle this situation, the `sync_table` Lambda function will attempt to drop and recreate any views that depend on the table being synced. The pgsql functions necessary to do this can be found in this repository: https://github.com/rvkulikov/pg-deps-management. You will need to run the `ddl.sql` script in your database to create the necessary functions. (details tbd)
+Occasionally the schema for a CD2 table will change. The DAP library applies these changes automatically with `ALTER TABLE`, and this application does nothing special to accommodate them.
+
+Note that PostgreSQL refuses to `ALTER TABLE` while a view depends on the table. This application creates no views, so it should not come up — but if you add your own views over the replicated tables, a CD2 schema change will start failing. `sync_table` reports that case as `needs_ddl_update` and the table is listed under `failed_ddl_update` in the SNS notification; you would need to drop the dependent views and re-run the workflow. If you want that handled automatically, the `deps_save_and_drop_dependencies` / `deps_restore_dependencies` functions from https://github.com/rvkulikov/pg-deps-management are one way to do it.
 
 ## Configuration
 
@@ -78,7 +108,7 @@ where `<environment>` is either `dev` or `prod`. You can also use the AWS SSM co
 
 ## Running the application
 
-By default the workflow that synchronizes the database will run ever three hours. You can also run the workflow manually via the AWS Console: navigate to the Step Functions console, find your `CD2RefreshStateMachine` in the list, and click the `Start execution` button.
+By default the workflow that synchronizes the database will run every three hours. You can also run the workflow manually via the AWS Console: navigate to the Step Functions console, find your `CD2RefreshStateMachine` in the list, and click the `Start execution` button.
 
 This application uses AWS Lambda to run the `init` and `sync` steps for each CD2 table. If the `init` or `sync` step for any given table takes longer than 15 minutes (the limit on how long Lambda functions can run), the workflow will fail. You will be able to see the error in the AWS Step Functions console. If this happens, you'll need to perform the first initialization for the problematic table manually using the DAP client.
 

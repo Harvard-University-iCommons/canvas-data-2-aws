@@ -1,5 +1,6 @@
 import asyncio
 import os
+from urllib.parse import quote_plus
 
 from aws_lambda_powertools import Logger
 from aws_lambda_powertools.utilities import parameters
@@ -51,8 +52,10 @@ def lambda_handler(event, context: LambdaContext):
 
     os.chdir("/tmp/")
 
+    loop = asyncio.new_event_loop()
     try:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
             init_table(credentials, api_base_url, db_connection, namespace, table_name)
         )
 
@@ -60,6 +63,8 @@ def lambda_handler(event, context: LambdaContext):
     except Exception as e:
         logger.exception(e)
         event['state'] = 'failed'
+    finally:
+        loop.close()
 
     logger.info(f"event: {event}")
 
@@ -67,5 +72,18 @@ def lambda_handler(event, context: LambdaContext):
 
 
 async def init_table(credentials, api_base_url, db_connection, namespace, table_name):
-    async with DAPClient(api_base_url, credentials) as session:
-        await SQLReplicator(session, db_connection).initialize(namespace, table_name)
+    logger.info(f"starting init for table: {namespace}.{table_name}")
+
+    async with DAPClient(api_base_url, credentials, tracking=False) as session:
+        sql_replicator = SQLReplicator(session, db_connection)
+
+        # brings the instructure_dap meta-schema up to the version this client expects;
+        # the dap CLI does this before every initdb/syncdb and it is not optional
+        await sql_replicator.version_upgrade()
+
+        async def replicate_table_fn(namespace: str, table: str):
+            await sql_replicator.initialize(namespace, table)
+
+        await session.execute_operation_on_tables(
+            namespace, table_name, "initdb", replicate_table_fn
+        )

@@ -1,6 +1,17 @@
 version = 0.1
 
+# The Lambda functions depend on packages with compiled extensions (asyncpg, tsv2py,
+# aiohttp). Building outside a container resolves wheels for the build host, which
+# produces a broken package whenever the host platform differs from the Lambda
+# runtime. Always build in the Lambda-matching container image.
+[default.build.parameters]
+use_container = true
+
 [dev]
+[dev.build]
+[dev.build.parameters]
+use_container = true
+
 [dev.deploy]
 [dev.deploy.parameters]
 stack_name = "canvas-data-2-dev"
@@ -14,6 +25,10 @@ tags = "environment=\"dev\""
 resolve_s3 = true
 
 [prod]
+[prod.build]
+[prod.build.parameters]
+use_container = true
+
 [prod.deploy]
 [prod.deploy.parameters]
 stack_name = "canvas-data-2-prod"
