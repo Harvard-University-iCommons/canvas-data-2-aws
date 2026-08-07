@@ -34,10 +34,12 @@ Parameters:
     Type: String
     Default: "16.14"
     Description: >
-      The Aurora PostgreSQL engine version to deploy. Pinned minor versions are
-      retired by AWS over time; if the stack fails to create, check
-      `aws rds describe-db-engine-versions --engine aurora-postgresql` for a
-      currently available version.
+      The Aurora PostgreSQL engine version to deploy. The dap client supports
+      PostgreSQL 16.3 and later; it does not check this at runtime, so an older
+      engine fails in obscure ways rather than reporting a clear error. Pinned
+      minor versions are also retired by AWS over time, so if the stack fails to
+      create, check `aws rds describe-db-engine-versions --engine
+      aurora-postgresql` for a currently available version.
 
   LogRetentionInDaysParameter:
     Type: Number

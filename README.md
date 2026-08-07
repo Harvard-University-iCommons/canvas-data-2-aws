@@ -13,6 +13,10 @@ client API in ways that are not backward compatible with 1.x, so the Lambda func
 same call sequence the `dap` CLI itself uses (`version_upgrade()` followed by
 `execute_operation_on_tables()`), and handle the `ExceptionGroup`s that the 2.x client raises.
 
+**This is a reference implementation.** It deploys and runs as-is, but it makes deliberately simple
+choices that you will most likely want to revisit before using it with real data — see
+[Adapting this for your own environment](#adapting-this-for-your-own-environment).
+
 This application uses an AWS Step Function to orchestrate the workflow:
 
 ![workflow diagram](canvas-data-2-step-function.png)
@@ -100,12 +104,16 @@ Beyond the VPC and subnet parameters, the template takes:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `EngineVersionParameter` | `16.14` | Aurora PostgreSQL engine version |
+| `EngineVersionParameter` | `16.14` | Aurora PostgreSQL engine version (16.3 or later) |
 | `MapMaxConcurrencyParameter` | `10` | How many tables to sync concurrently |
 | `DatabaseMinCapacityParameter` | `0.5` | Minimum Aurora Serverless v2 capacity (ACU) |
 | `DatabaseMaxCapacityParameter` | `4` | Maximum Aurora Serverless v2 capacity (ACU) |
 | `LogRetentionInDaysParameter` | `30` | CloudWatch log retention |
 | `SkipTablesParameter` | — | Comma-separated list of tables to skip |
+
+The `dap` client supports **PostgreSQL 16.3 and later**. It does not verify this at runtime, so
+pairing it with an older engine fails in obscure ways rather than reporting a clear error — don't
+lower `EngineVersionParameter` below that.
 
 AWS retires pinned Aurora minor versions over time, so if stack creation fails complaining about
 the engine version, pick a currently available one:
@@ -167,6 +175,79 @@ By default the workflow that synchronizes the database will run every three hour
 This application uses AWS Lambda to run the `init` and `sync` steps for each CD2 table. If the `init` or `sync` step for any given table takes longer than 15 minutes (the limit on how long Lambda functions can run), the workflow will fail. You will be able to see the error in the AWS Step Functions console. If this happens, you'll need to perform the first initialization for the problematic table manually using the DAP client.
 
 TODO: details on how to initialize a table using the DAP client
+
+## Adapting this for your own environment
+
+This is a reference implementation. It deploys and works as-is, but it makes choices that suit a
+demonstration rather than any particular institution's production environment. The areas below are
+the ones most likely to need attention, roughly in the order they tend to matter.
+
+### Assumptions baked into the design
+
+* **One Canvas instance, one database, one schema.** The functions read a single pair of DAP
+  credentials from a fixed SSM path and replicate the `canvas` namespace into a single database.
+  Replicating multiple Canvas instances, or several tenants into separate schemas, means threading
+  a database/tenant identifier through the Step Function payload and the SSM parameter paths.
+* **No views over the replicated tables.** See the note under *Preparing the database* — adding your
+  own views changes how CD2 schema changes behave.
+* **Two environments, `dev` and `prod`,** defined in `samconfig.toml` and enforced by
+  `EnvironmentParameter`'s allowed values. Add more there if you need them.
+
+### Security
+
+Security hardening is deliberately minimal here so the template stays readable. Before running this
+with real data, consider:
+
+* **KMS key**: no automatic rotation, no alias, and the default key policy. Consider
+  `EnableKeyRotation`, and an explicit key policy scoped to the roles that actually need the key.
+* **Only the secrets are encrypted.** The database credentials use the stack's KMS key. The log
+  groups and the SNS topic are not encrypted; they carry table names, row counts and error messages
+  rather than Canvas data itself. Extending encryption to them is left as an exercise — note that it
+  needs key policy grants for the CloudWatch Logs and CloudWatch Alarms service principals, since
+  CloudWatch Logs encrypts through its own service principal rather than the writing role, and an
+  alarm that cannot use the key stops notifying with an error that appears only in its alarm history.
+* **Security groups**: no egress rules are declared, so EC2's default allow-all egress applies. The
+  database security group also has a `TODO` for whatever ingress your own analysts or BI tools need.
+* **`DeletionProtection` is `false`** on the database cluster, which is convenient for a
+  proof-of-concept and wrong for anything you care about. Note that `AWS::RDS::DBCluster` defaults
+  to `DeletionPolicy: Snapshot`, so a stack deletion does leave a final snapshot behind.
+* **Secrets are never rotated.** The database user credential is generated once at deploy time.
+* **The RDS Data API is enabled** (`EnableHttpEndpoint: true`) because `prepare_aurora_db.py` uses
+  it to create the database user. It is IAM-gated, but it is an additional path to the database. If
+  you provision the database user some other way, you can turn it off.
+
+### Networking and cost
+
+* **A NAT gateway is required** (see *Network access for the Lambda functions*) and is usually the
+  largest fixed cost in this stack — frequently more than the database itself at low usage.
+* **Aurora Serverless v2 minimum capacity is a continuous charge**, not a ceiling. Raising
+  `DatabaseMinCapacityParameter` to fix connection pressure raises your bill around the clock.
+* **Interface endpoints for Secrets Manager and SSM** are optional once NAT exists, and each carries
+  its own hourly charge. They are worth it if you want that traffic off the public internet.
+* **Log retention** defaults to 30 days. Verbose DAP output across many tables adds up.
+
+### Sizing and limits
+
+* **Lambda's 15-minute ceiling** applies to each table's init and sync. Very large tables — the
+  submissions-related ones are the usual culprits — can exceed it, in which case that table needs to
+  be initialized out-of-band with the `dap` CLI. This is the most likely reason to outgrow this
+  architecture entirely and move the work to ECS or Batch.
+* **`MapMaxConcurrencyParameter` and `DatabaseMinCapacityParameter` are coupled.** See *Template
+  parameters*.
+* **Function memory** (`MemorySize`) was chosen by rough estimate, not measurement. Init runs at
+  8192 MB largely to get proportional CPU. Measure before assuming these are right for your data.
+* **The schedule is every three hours.** CD2 data is not real-time, so syncing more often mostly
+  costs money; syncing less often risks longer, heavier incremental syncs.
+
+### Build and deployment
+
+* **`x86_64` versus `arm64`** — see the note under *Deploying the application*.
+* **Resource names are prefixed `cd2-`.** If you deploy more than one instance of this stack into an
+  account, those names will collide; add your own distinguishing prefix.
+* **The stack exports the cluster and admin secret ARNs.** If nothing consumes them, you can drop
+  the exports; if something does, be aware that renaming them later will block stack updates.
+* **There is no CI.** Consider running `sam validate --lint`, `ruff check`, and `sam build` on pull
+  requests.
 
 ## Cleanup
 
