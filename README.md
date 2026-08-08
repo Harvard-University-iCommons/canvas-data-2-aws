@@ -1,355 +1,269 @@
 # canvas-data-2-aws - WORK IN PROGRESS
 
-This project contains source code and supporting files for a serverless application that you can use to download and maintain a Canvas Data 2 replica database.
-You can deploy this application to your AWS account with the SAM CLI. It includes the following files and folders.
-
-- `list_tables` - Code for a Lambda function that fetches the list of CD2 tables using the `dap` client library.
-- `sync_table` - Code for a Lambda function that syncs a table using the `dap` client library.
-- `init_table` - Code for a Lambda function that inits a table using the `dap` client library.
-- `template.yaml` - A template that defines the application's AWS resources.
-- `bootstrap.py` - A helper script that prepares a deployed stack: stores the DAP API credentials and creates the database user and schemas.
-
-This application targets version 2.x of the `instructure-dap-client` library. Version 2 changed the
-client API in ways that are not backward compatible with 1.x, so the Lambda functions here follow the
-same call sequence the `dap` CLI itself uses (`version_upgrade()` followed by
-`execute_operation_on_tables()`), and handle the `ExceptionGroup`s that the 2.x client raises.
+A serverless application that builds and maintains a PostgreSQL replica of your Canvas Data 2 data.
+A Step Function runs every three hours, syncing each CD2 table into an Aurora database using
+Instructure's `dap` client library. Deploy it to your AWS account with the SAM CLI.
 
 **This is a reference implementation.** It deploys and runs as-is, but it makes deliberately simple
-choices that you will most likely want to revisit before using it with real data — see
+choices you will want to revisit before using it with real data — see
 [Adapting this for your own environment](#adapting-this-for-your-own-environment).
 
-This application uses an AWS Step Function to orchestrate the workflow:
+## Quick start
 
-![workflow diagram](canvas-data-2-step-function.png)
+This path creates everything, including its own VPC, so you need no existing AWS networking.
 
-## Application workflow
+**Before you start, you need:**
 
-1. The Step Function is executed on an hourly schedule via EventBridge.
-2. The first step executes the `list_tables` Lambda functions which retrieves the list of CD2 tables from the API.
-3. The list of tables is passed to a `Map` step which executes the following steps for each item in the list:
-   1. The `sync_table` Lambda function is executed. It returns one of `complete`, `needs_init` (the table doesn't exist in the database yet), `needs_ddl_update` (a schema change could not be applied), or `failed`.
-   2. The output of `sync_table` is checked. If the table synced, the iteration is complete. If `needs_init` was returned, the `init_table` function is executed. Anything else ends the iteration as a failure.
-   3. If executed, the output of `init_table` is checked; `failed` ends the iteration as a failure, anything else as a success.
-4. Once all iterations are complete, a notification is sent to an SNS topic summarizing which tables completed and which failed.
+* **[SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)** — builds and deploys the stack
+* **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — manages the local Python environment. You do not need to install Python; uv fetches its own.
+* **[Docker](https://docs.docker.com/get-docker/)** — `sam build` compiles the functions' dependencies inside a container
+* **A DAP API client ID and secret**, from [identity.instructure.com](https://identity.instructure.com)
+* **AWS credentials** with permission to create VPC, RDS, Lambda, Step Functions, IAM, KMS, Secrets
+  Manager and SSM resources. The SAM CLI uses the same credentials as the AWS CLI, so run
+  `aws configure` (or `aws sso login --profile <name>` if your organization uses IAM Identity
+  Center) and confirm with `aws sts get-caller-identity`. See
+  [Authentication and access credentials](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-authentication.html)
+  for the other options.
 
-## Prerequisites
-
-It will be helpful to have a working knowledge of AWS services and the AWS Console.
-
-**If you just want to try this out**, set `CreateNetworkParameter` to `Yes` and the stack will build
-its own VPC, subnets and NAT gateway. You then need none of the networking below — skip to
-[Deploying the application](#deploying-the-application). Be aware that the NAT gateway is billed by
-the hour whether or not the workflow is running (currently about $33/month in `us-east-1`, plus
-$0.045/GB); deleting the stack stops that charge.
-
-Otherwise, to deploy into a VPC you already have (`CreateNetworkParameter` left at its `No`
-default), you will need:
-* A VPC
-* One or more subnets where the Lambda functions can be deployed
-* **At least two subnets, in different Availability Zones**, where the database cluster can be
-  deployed (these can be the same as the Lambda subnets). RDS requires a DB subnet group to cover
-  at least two AZs even though this template creates only a single database instance. If you supply
-  subnets from a single AZ, stack creation fails with `DB Subnet Group doesn't meet availability
-  zone coverage requirement. Please add subnets to cover at least 2 availability zones.`
-* **Outbound internet access from the Lambda subnets** — see below
-
-### Network access for the Lambda functions
-
-The Lambda functions are attached to your VPC so that they can reach the database, and a
-VPC-attached Lambda has no internet access by default. The functions need to reach three things:
-
-| Destination | Why | How to provide it |
-| --- | --- | --- |
-| `api-gateway.instructure.com` | The DAP API — where the data comes from | **NAT gateway (or equivalent egress).** There is no VPC endpoint for a third-party service. |
-| AWS Secrets Manager | Reading the database user credential | NAT gateway, or a [Secrets Manager interface endpoint](https://docs.aws.amazon.com/secretsmanager/latest/userguide/vpc-endpoint-overview.html) |
-| AWS SSM Parameter Store | Reading the DAP client ID and secret | NAT gateway, or [VPC endpoints for Systems Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-create-vpc.html#sysman-setting-up-vpc-create) |
-
-**A NAT gateway is effectively required**, because the DAP API is a public endpoint that no VPC
-endpoint can reach. Once you have one, the Secrets Manager and SSM interface endpoints become
-optional — they only keep that traffic off the public internet. Without egress, the functions
-will simply time out.
-
-The functions also have X-Ray tracing enabled, which needs the same outbound access (or an
-X-Ray VPC endpoint).
-
-By default the database will not have a public IP address and will not be accessible outside of your VPC. You will need to configure network access to the database as appropriate for your situation.
-
-## Deploying the application
-
-The Serverless Application Model Command Line Interface (SAM CLI) is an extension of the AWS CLI that adds functionality for building and testing Lambda applications. It uses Docker to run your functions in an Amazon Linux environment that matches Lambda. It can also emulate your application's build environment and API.
-
-To use the SAM CLI to deploy this application, you need the following tools.
-
-* SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
-* [uv](https://docs.astral.sh/uv/getting-started/installation/) - manages the local Python environment
-* [Docker](https://docs.docker.com/get-docker/) - required, see below
-
-You do not need to install Python yourself; uv downloads a suitable version if you don't already
-have one. Create the local environment with:
+**1. Create the local environment**
 
 ```bash
 uv sync
 ```
 
-That environment is used by the `bootstrap.py` helper script. The Lambda functions do not
-use it — `sam build` installs each function's own `requirements.txt` inside a container.
-
-Docker is required because these functions depend on packages with compiled C extensions
-(`asyncpg`, `tsv2py`, `aiohttp`). A plain `sam build` installs wheels built for *your* machine,
-which produces a deployment package that fails at runtime whenever your platform differs from the
-Lambda runtime. `samconfig.toml` therefore sets `use_container = true`, so `sam build` compiles
-inside the Lambda-matching container image. If you invoke `sam build` without the config file,
-pass `--use-container` explicitly.
-
-The functions are configured for `x86_64`. You can switch them to `arm64` (cheaper and faster on
-Graviton) by changing the three `Architectures` entries in `template.yaml`; note that `tsv2py`
-publishes no `linux-aarch64` wheels as of 0.8.0, so an arm64 build compiles it from source and
-takes longer. Building for an architecture that differs from your host works but runs under
-emulation, which is slow.
-
-To build and deploy your application for the first time, run the following in your shell:
+**2. Build and deploy**
 
 ```bash
 sam build
 sam deploy --guided
 ```
 
-The first command will build the source of your application. The second command will package and deploy your application to AWS, with a series of prompts:
+At the prompts, set `CreateNetworkParameter` to `Yes` and accept the defaults for
+`VpcIdParameter`, `DatabaseSubnetListParameter` and `LambdaSubnetListParameter` — leaving them
+blank is what tells the stack to build its own network. Answer `y` to allow IAM role creation, and
+save your answers to `samconfig.toml` so later deploys need no prompting.
 
-* **Stack Name**: The name of the stack to deploy to CloudFormation. This should be unique to your account and region, and a good starting point would be something matching your project name.
-* **AWS Region**: The AWS region you want to deploy your app to.
-* **Confirm changes before deploy**: If set to yes, any change sets will be shown to you before execution for manual review. If set to no, the AWS SAM CLI will automatically deploy application changes.
-* **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modifies IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
-* **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
+This creates a VPC with two public and two private subnets across two Availability Zones, one NAT
+gateway, and the Aurora cluster. Their IDs are stack outputs.
+
+**3. Prepare the stack**
+
+```bash
+uv run bootstrap.py --stack-name <the stack name you chose>
+```
+
+This prompts for your DAP client ID and secret, stores them, and creates the database user and
+schemas. It is safe to re-run.
+
+**4. Run it**
+
+The workflow runs every three hours on its own. To trigger it immediately, open the Step Functions
+console, select `CD2RefreshStateMachine`, and choose **Start execution**.
+
+The first run initializes every table and takes considerably longer than later incremental syncs.
+Results are published to the stack's SNS topic — subscribe to it to get them.
+
+> **Cost.** The NAT gateway this creates is billed hourly whether or not the workflow runs — about
+> $33/month in `us-east-1`, plus $0.045/GB — and the Aurora cluster has a continuous floor of its
+> own. If you are only evaluating, [delete the stack](#cleanup) when you are done.
+
+## How it works
+
+![workflow diagram](canvas-data-2-step-function.png)
+
+EventBridge starts the Step Function on a schedule. `list_tables` fetches the CD2 table list, and a
+`Map` state processes each table concurrently: `sync_table` performs an incremental sync, and if the
+table does not exist yet it returns `needs_init` and the workflow runs `init_table` instead. When
+every table is done, a summary is published to SNS.
+
+| Path | What it is |
+| --- | --- |
+| `list_tables/` | Lambda: fetches the list of CD2 tables |
+| `sync_table/` | Lambda: incrementally syncs one table |
+| `init_table/` | Lambda: performs the first full load of one table |
+| `template.yaml` | All AWS resources |
+| `bootstrap.py` | Post-deploy setup: DAP credentials, database user and schemas |
+
+## Deploying into an existing VPC
+
+Leave `CreateNetworkParameter` at its `No` default and supply your own network instead. You will
+need:
+
+* A VPC
+* One or more subnets for the Lambda functions
+* **At least two subnets in different Availability Zones** for the database (they can be the same
+  subnets). RDS requires this even though the template creates a single database instance;
+  otherwise stack creation fails with `DB Subnet Group doesn't meet availability zone coverage
+  requirement.`
+* **Outbound internet access from the Lambda subnets**, which in practice means a NAT gateway
+
+The functions run inside your VPC and so have no internet access by default. They need to reach:
+
+| Destination | For | Provided by |
+| --- | --- | --- |
+| `api-gateway.instructure.com` | The DAP API | **NAT gateway only** — no VPC endpoint can reach a third-party service |
+| AWS Secrets Manager | The database credential | NAT gateway, or an interface endpoint |
+| AWS SSM Parameter Store | The DAP credentials | NAT gateway, or an interface endpoint |
+
+Because the DAP API is a public endpoint, a NAT gateway is effectively required; the two interface
+endpoints are then optional and only keep that traffic off the public internet. Without egress the
+functions simply time out. X-Ray tracing needs the same access.
+
+## Configuration reference
 
 ### Template parameters
-
-Beyond the VPC and subnet parameters, the template takes:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `CreateNetworkParameter` | `No` | Create a VPC, subnets and NAT gateway for this stack |
 | `VpcCidrParameter` | `10.0.0.0/16` | CIDR for the created VPC (ignored unless creating one) |
-| `EngineVersionParameter` | `16.14` | Aurora PostgreSQL engine version (16.3 or later) |
+| `VpcIdParameter` | — | Required when not creating the network |
+| `DatabaseSubnetListParameter` | — | Required when not creating the network |
+| `LambdaSubnetListParameter` | — | Required when not creating the network |
+| `EngineVersionParameter` | `16.14` | Aurora PostgreSQL version — the `dap` client requires 16.3 or later |
 | `DatabaseMinCapacityParameter` | `0.5` | Minimum Aurora Serverless v2 capacity (ACU) |
 | `DatabaseMaxCapacityParameter` | `4` | Maximum Aurora Serverless v2 capacity (ACU) |
 | `LogRetentionInDaysParameter` | `30` | CloudWatch log retention |
 | `SkipTablesParameter` | — | Comma-separated list of tables to skip |
+| `EnvironmentParameter` | `dev` | `dev` or `prod`; namespaces resource names and the SSM path |
 
-The `dap` client supports **PostgreSQL 16.3 and later**. It does not verify this at runtime, so
-pairing it with an older engine fails in obscure ways rather than reporting a clear error — don't
-lower `EngineVersionParameter` below that.
+If stack creation fails on the engine version, AWS has retired that minor release — pick a current
+one with `aws rds describe-db-engine-versions --engine aurora-postgresql`.
 
-AWS retires pinned Aurora minor versions over time, so if stack creation fails complaining about
-the engine version, pick a currently available one:
-
-```bash
-aws rds describe-db-engine-versions --engine aurora-postgresql \
-  --query 'DBEngineVersions[].EngineVersion' --output text
-```
-
-**Concurrency and database capacity are linked.** Each concurrent table sync opens its own
-connection, and Aurora Serverless v2 scales `max_connections` with ACU capacity. The defaults are
-conservative because the first run is the heaviest — every table needs to be initialized at once
-against a cluster sitting at its minimum capacity. If you see connection errors, either raise
-`DatabaseMinCapacityParameter` or lower the Map state's `MaxConcurrency` (currently `10`) in
-`template.yaml`. Note that raising the minimum capacity raises your continuous cost, since it is
-the floor you pay for whether or not the workflow is running.
-
-`MaxConcurrency` is a literal in the template rather than a stack parameter because CloudFormation
-resolves intrinsic functions inside an inline state machine definition to strings, and the Amazon
-States Language requires an integer there.
-
-### Letting the stack create the network
-
-With `CreateNetworkParameter=Yes`, leave `VpcIdParameter`, `DatabaseSubnetListParameter` and
-`LambdaSubnetListParameter` blank and the stack creates:
-
-```
-VPC 10.0.0.0/16
-├── public subnet  (AZ a) ── NAT gateway + Elastic IP
-├── public subnet  (AZ b)
-├── private subnet (AZ a) ── Lambda functions + database
-└── private subnet (AZ b) ── Lambda functions + database
-```
-
-Two Availability Zones, because that is the RDS DB subnet group minimum. Both private subnets route
-outbound traffic through the single NAT gateway; a production deployment would usually use one per
-AZ so that losing an AZ does not stop the workflow. Subnet ranges are derived from
-`VpcCidrParameter`, so changing it is enough to avoid a collision with an existing network.
-
-The created VPC and subnet IDs are stack outputs, so you can find them without hunting through the
-console.
-
-Deploying into an existing VPC instead is the default; those three parameters are then required, and
-the stack fails immediately with a message naming the missing one rather than partway through
-creating resources.
-
-## Preparing the stack
-
-Two things have to happen after `sam deploy` before the workflow can run: the DAP API credentials
-need to be stored, and the database user the Lambda functions connect as needs to be created.
-`bootstrap.py` does both:
-
-```
-uv run bootstrap.py --stack-name <stack name returned by the SAM deployment>
-```
-
-It prompts for the DAP client ID and secret (the secret is hidden as you type), then creates the
-database user, its schema, and the `instructure_dap` schema the DAP client keeps its metadata in.
-Both halves are idempotent, so re-running is safe: credentials that are already stored are left
-alone unless you pass `--update-credentials`, and an existing database user has its password reset
-to match the secret.
-
-Useful flags:
+### bootstrap.py
 
 | Flag | Effect |
 | --- | --- |
+| `--stack-name` | Required. The deployed stack to prepare. |
 | `--update-credentials` | Replace DAP credentials that are already stored |
-| `--dap-client-id`, `--dap-client-secret` | Supply credentials non-interactively instead of being prompted |
+| `--dap-client-id`, `--dap-client-secret` | Supply credentials non-interactively |
 | `--skip-credentials` | Only prepare the database |
 | `--skip-database` | Only store the credentials |
 
-This uses the environment created by `uv sync` above; `uv run` will also create it on the spot if
-you skipped that step. The script needs permission to read the stack, read and write the
-`/<environment>/canvas_data_2` SSM parameters, read the stack's secrets, and call the RDS Data API.
+It needs permission to read the stack, read and write the `/<environment>/canvas_data_2` SSM
+parameters, read the stack's secrets, and call the RDS Data API. It reaches the database through
+the RDS Data API rather than a direct connection, so it can run from outside the VPC.
 
-The database half connects through the RDS Data API rather than a direct database connection, so it
-can be run from outside the VPC — but the cluster must have `EnableHttpEndpoint` set, which this
-template does by default.
-
-Occasionally the schema for a CD2 table will change. The DAP library applies these changes automatically with `ALTER TABLE`, and this application does nothing special to accommodate them.
-
-Note that PostgreSQL refuses to `ALTER TABLE` while a view depends on the table. This application creates no views, so it should not come up — but if you add your own views over the replicated tables, a CD2 schema change will start failing. `sync_table` reports that case as `needs_ddl_update` and the table is listed under `failed_ddl_update` in the SNS notification; you would need to drop the dependent views and re-run the workflow. If you want that handled automatically, the `deps_save_and_drop_dependencies` / `deps_restore_dependencies` functions from https://github.com/rvkulikov/pg-deps-management are one way to do it.
+To set the DAP credentials by hand instead, they are two SecureString parameters under
+`/<environment>/canvas_data_2/`, named `dap_client_id` and `dap_client_secret`. Leave them
+encrypted with the default `alias/aws/ssm` key — `ListTablesFunction` has parameter read access but
+no KMS permissions, so a customer-managed key breaks it at runtime.
 
 ## Monitoring
 
-The workflow publishes a summary to the `WorkflowNotificationTopic` SNS topic at the end of every
-run, listing which tables completed and which failed. Subscribe to that topic to receive them.
+Every run publishes a summary to the stack's SNS topic listing which tables completed and which
+failed. Because that arrives whether or not anything went wrong, a CloudWatch alarm
+(`cd2-<environment>-workflow-failed`) publishes to the same topic when an execution actually fails.
 
-Because that notification is sent on every run whether or not anything went wrong, a CloudWatch
-alarm (`cd2-<environment>-workflow-failed`) also publishes to the same topic when a Step Functions
-execution actually fails, so real failures are distinguishable from the routine summaries.
+Step Functions execution history goes to `/aws/vendedlogs/states/cd2-<environment>-refresh` and each
+function logs to `/aws/lambda/cd2-<environment>-<function>`, both retained for
+`LogRetentionInDaysParameter` days. X-Ray tracing is enabled throughout.
 
-Step Functions execution history is logged to `/aws/vendedlogs/states/cd2-<environment>-refresh`,
-and each Lambda function logs to `/aws/lambda/cd2-<environment>-<function>`. All of these use the
-retention set by `LogRetentionInDaysParameter`; note that Lambda's default log groups never expire,
-which is why the template declares them explicitly. X-Ray tracing is enabled on the functions and
-the state machine.
+## Operating notes
 
-## Configuration
-
-In order for the application to use the DAP API, you will need to provide a client ID and secret.
-These are stored as SecureString parameters in AWS SSM Parameter Store and read by the Lambda
-functions at runtime. `bootstrap.py` stores them for you — see *Preparing the stack* above — and
-prompts for the secret with the input hidden so that it does not end up in your shell history.
-
-To replace credentials that are already stored:
-```
-uv run bootstrap.py --stack-name <stack name> --update-credentials
-```
-
-If you would rather set them by hand, they are two parameters under `/<environment>/canvas_data_2`,
-where `<environment>` matches the stack's `EnvironmentParameter`:
-```
-aws ssm put-parameter --name '/<environment>/canvas_data_2/dap_client_id' --type SecureString --value '<your client ID>'
-aws ssm put-parameter --name '/<environment>/canvas_data_2/dap_client_secret' --type SecureString --value '<your client secret>'
-```
-Leave them encrypted with the default `alias/aws/ssm` key. `ListTablesFunction` is granted parameter
-read access but no KMS permissions, so a customer-managed key would break it at runtime.
-
-## Running the application
-
-By default the workflow that synchronizes the database will run every three hours. You can also run the workflow manually via the AWS Console: navigate to the Step Functions console, find your `CD2RefreshStateMachine` in the list, and click the `Start execution` button.
-
-This application uses AWS Lambda to run the `init` and `sync` steps for each CD2 table. If the `init` or `sync` step for any given table takes longer than 15 minutes (the limit on how long Lambda functions can run), the workflow will fail. You will be able to see the error in the AWS Step Functions console. If this happens, you'll need to perform the first initialization for the problematic table manually using the DAP client.
+**Large tables can exceed Lambda's 15-minute limit.** If a table's init or sync does, the workflow
+fails and the error appears in the Step Functions console. That table has to be initialized
+out-of-band with the `dap` CLI.
 
 TODO: details on how to initialize a table using the DAP client
 
-## Adapting this for your own environment
+**Schema changes are handled automatically.** The DAP library applies them with `ALTER TABLE`, and
+this application does nothing special to accommodate them. PostgreSQL does refuse to `ALTER TABLE`
+while a view depends on the table — this application creates no views, so it should not arise, but
+if you add your own, `sync_table` reports the table as `needs_ddl_update` and lists it under
+`failed_ddl_update` in the notification. You would drop the dependent views and re-run.
 
-This is a reference implementation. It deploys and works as-is, but it makes choices that suit a
-demonstration rather than any particular institution's production environment. The areas below are
-the ones most likely to need attention, roughly in the order they tend to matter.
-
-### Assumptions baked into the design
-
-* **One Canvas instance, one database, one schema.** The functions read a single pair of DAP
-  credentials from a fixed SSM path and replicate the `canvas` namespace into a single database.
-  Replicating multiple Canvas instances, or several tenants into separate schemas, means threading
-  a database/tenant identifier through the Step Function payload and the SSM parameter paths.
-* **No views over the replicated tables.** See the note under *Preparing the stack* — adding your
-  own views changes how CD2 schema changes behave.
-* **Two environments, `dev` and `prod`,** defined in `samconfig.toml` and enforced by
-  `EnvironmentParameter`'s allowed values. Add more there if you need them.
-
-### Security
-
-Security hardening is deliberately minimal here so the template stays readable. Before running this
-with real data, consider:
-
-* **KMS key**: no automatic rotation, no alias, and the default key policy. Consider
-  `EnableKeyRotation`, and an explicit key policy scoped to the roles that actually need the key.
-* **Only the secrets are encrypted.** The database credentials use the stack's KMS key. The log
-  groups and the SNS topic are not encrypted; they carry table names, row counts and error messages
-  rather than Canvas data itself. Extending encryption to them is left as an exercise — note that it
-  needs key policy grants for the CloudWatch Logs and CloudWatch Alarms service principals, since
-  CloudWatch Logs encrypts through its own service principal rather than the writing role, and an
-  alarm that cannot use the key stops notifying with an error that appears only in its alarm history.
-* **Security groups**: no egress rules are declared, so EC2's default allow-all egress applies. The
-  database security group also has a `TODO` for whatever ingress your own analysts or BI tools need.
-* **`DeletionProtection` is `false`** on the database cluster, which is convenient for a
-  proof-of-concept and wrong for anything you care about. Note that `AWS::RDS::DBCluster` defaults
-  to `DeletionPolicy: Snapshot`, so a stack deletion does leave a final snapshot behind.
-* **Secrets are never rotated.** The database user credential is generated once at deploy time.
-* **The RDS Data API is enabled** (`EnableHttpEndpoint: true`) because `bootstrap.py` uses
-  it to create the database user. It is IAM-gated, but it is an additional path to the database. If
-  you provision the database user some other way, you can turn it off.
-
-### Networking and cost
-
-* **A NAT gateway is required** (see *Network access for the Lambda functions*) and is usually the
-  largest fixed cost in this stack — frequently more than the database itself at low usage.
-* **Aurora Serverless v2 minimum capacity is a continuous charge**, not a ceiling. Raising
-  `DatabaseMinCapacityParameter` to fix connection pressure raises your bill around the clock.
-* **Interface endpoints for Secrets Manager and SSM** are optional once NAT exists, and each carries
-  its own hourly charge. They are worth it if you want that traffic off the public internet.
-* **Log retention** defaults to 30 days. Verbose DAP output across many tables adds up.
-
-### Sizing and limits
-
-* **Lambda's 15-minute ceiling** applies to each table's init and sync. Very large tables — the
-  submissions-related ones are the usual culprits — can exceed it, in which case that table needs to
-  be initialized out-of-band with the `dap` CLI. This is the most likely reason to outgrow this
-  architecture entirely and move the work to ECS or Batch.
-* **The Map state's `MaxConcurrency` and `DatabaseMinCapacityParameter` are coupled.** See *Template
-  parameters*.
-* **Function memory** (`MemorySize`) was chosen by rough estimate, not measurement. Init runs at
-  8192 MB largely to get proportional CPU. Measure before assuming these are right for your data.
-* **The schedule is every three hours.** CD2 data is not real-time, so syncing more often mostly
-  costs money; syncing less often risks longer, heavier incremental syncs.
-
-### Build and deployment
-
-* **`x86_64` versus `arm64`** — see the note under *Deploying the application*.
-* **Resource names are prefixed `cd2-`.** If you deploy more than one instance of this stack into an
-  account, those names will collide; add your own distinguishing prefix.
-* **The stack exports the cluster and admin secret ARNs.** If nothing consumes them, you can drop
-  the exports; if something does, be aware that renaming them later will block stack updates.
-* **There is no CI.** Consider running `sam validate --lint`, `ruff check`, and `sam build` on pull
-  requests.
+**Concurrency and database capacity are linked.** Each concurrent sync opens its own connection, and
+Aurora Serverless v2 scales `max_connections` with capacity. If you see connection errors, raise
+`DatabaseMinCapacityParameter` or lower the Map state's `MaxConcurrency` (currently `10`) in
+`template.yaml`. Raising the minimum capacity raises your bill continuously.
 
 ## Cleanup
 
-To delete the application that you created, use the AWS CLI. Assuming you used your project name for the stack name, you can run the following:
-
 ```bash
-aws cloudformation delete-stack --stack-name canvas-data-2
+aws cloudformation delete-stack --stack-name <your stack name>
 ```
 
-Alternatively, you can delete the stack in the CloudFormation console (within the AWS web console).
+This removes the NAT gateway and releases its Elastic IP, which is what stops the hourly charge.
 
-If you deployed with `CreateNetworkParameter=Yes`, deleting the stack also removes the NAT gateway
-and releases its Elastic IP, which is what stops the hourly charge. Note that the database cluster
-is left behind as a final snapshot — `AWS::RDS::DBCluster` defaults to `DeletionPolicy: Snapshot` —
-so delete that snapshot too if you do not want to keep paying for its storage.
+Two things are left behind on purpose, and you should deal with both:
+
+**The DAP credentials.** `bootstrap.py` creates these outside CloudFormation, so deleting the stack
+does not remove them — your client secret stays in Parameter Store until you delete it:
+
+```bash
+aws ssm delete-parameters --names \
+  "/<environment>/canvas_data_2/dap_client_id" \
+  "/<environment>/canvas_data_2/dap_client_secret"
+```
+
+where `<environment>` matches the stack's `EnvironmentParameter`.
+
+**The database snapshot.** `AWS::RDS::DBCluster` defaults to `DeletionPolicy: Snapshot`, so the
+cluster is retained as a final snapshot. Delete it from the RDS console or with
+`aws rds delete-db-cluster-snapshot` if you do not want to keep paying for its storage.
+
+## Adapting this for your own environment
+
+The choices below suit a demonstration rather than any particular institution's production
+environment, roughly in the order they tend to matter.
+
+### Assumptions in the design
+
+* **One Canvas instance, one database, one schema.** The functions read a single pair of DAP
+  credentials from a fixed SSM path and replicate the `canvas` namespace into a single database.
+  Supporting multiple instances or tenants means threading an identifier through the Step Function
+  payload and the SSM paths.
+* **No views over the replicated tables.** See *Operating notes*.
+* **Two environments, `dev` and `prod`,** defined in `samconfig.toml` and enforced by
+  `EnvironmentParameter`.
+
+### Security
+
+Hardening is minimal here so the template stays readable. Before using real data, consider:
+
+* **KMS key**: no automatic rotation, no alias, and the default key policy.
+* **Only the secrets are encrypted.** Log groups and the SNS topic are not; they carry table names,
+  row counts and error messages rather than Canvas data. Extending encryption to them needs key
+  policy grants for the CloudWatch Logs and CloudWatch Alarms service principals — Logs encrypts
+  through its own service principal rather than the writing role, and an alarm that cannot use the
+  key stops notifying with an error visible only in its alarm history.
+* **Security groups** declare no egress rules, so the default allow-all applies. The database group
+  also has a `TODO` for whatever ingress your analysts or BI tools need.
+* **`DeletionProtection` is `false`** on the database cluster.
+* **Secrets are never rotated.** The database credential is generated once at deploy time.
+* **The RDS Data API is enabled** because `bootstrap.py` uses it. It is IAM-gated, but it is an
+  additional path to the database; if you create the database user another way, turn it off.
+
+### Cost
+
+* **The NAT gateway is usually the largest fixed cost**, frequently more than the database at low
+  usage. The template creates one, not one per AZ, so losing an AZ stops the workflow.
+* **Aurora Serverless v2 minimum capacity is a continuous charge**, not a ceiling.
+* **Interface endpoints** for Secrets Manager and SSM each carry their own hourly charge.
+
+### Sizing and limits
+
+* **Lambda's 15-minute ceiling** is the most likely reason to outgrow this architecture and move the
+  work to ECS or Batch.
+* **Function memory** was chosen by estimate, not measurement. `init_table` runs at 8192 MB largely
+  to get proportional CPU. Measure before assuming these fit your data.
+* **The schedule is every three hours.** CD2 data is not real-time, so syncing more often mostly
+  costs money; less often makes each incremental sync heavier.
+
+### Build and deployment
+
+* **Docker is required** because the functions depend on compiled extensions (`asyncpg`, `tsv2py`,
+  `aiohttp`). `samconfig.toml` sets `use_container = true` so `sam build` compiles inside the
+  Lambda-matching image; building without it produces wheels for your machine and a package that
+  fails at runtime. Pass `--use-container` explicitly if you build without the config file.
+* **`x86_64` versus `arm64`.** The functions are `x86_64`. Switching the three `Architectures`
+  entries to `arm64` is cheaper to run, but `tsv2py` publishes no `linux-aarch64` wheels as of
+  0.8.0, so it compiles from source and builds take longer. Building for an architecture other than
+  your host works but runs under emulation.
+* **Resource names are prefixed `cd2-`.** Deploying two instances of this stack into one account
+  will collide; add your own prefix.
+* **The stack exports the cluster and admin secret ARNs.** Renaming those exports later will block
+  stack updates if anything imports them.
+* **There is no CI.** Consider running `sam validate --lint`, `ruff check` and `sam build` on pull
+  requests.
