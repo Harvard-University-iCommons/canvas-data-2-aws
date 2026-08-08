@@ -1,4 +1,4 @@
-# canvas-data-2-aws - WORK IN PROGRESS
+# canvas-data-2-aws
 
 A serverless application that builds and maintains a PostgreSQL replica of your Canvas Data 2 data.
 A Step Function runs every three hours, syncing each CD2 table into an Aurora database using
