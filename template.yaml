@@ -136,10 +136,24 @@ Rules:
         AssertDescription: >
           VpcIdParameter is required when CreateNetworkParameter is No. Set
           CreateNetworkParameter to Yes to have the stack create its own network.
-      - Assert: !Not [!Equals [!Join ["", !Ref DatabaseSubnetListParameter], ""]]
+      # The Rules block supports only its own small set of functions -- Fn::And,
+      # Fn::Contains, Fn::EachMemberEquals, Fn::EachMemberIn, Fn::Equals, Fn::Not,
+      # Fn::Or, Fn::RefAll, Fn::ValueOf, Fn::ValueOfAll and Ref. Anything else,
+      # including Fn::Join, is rejected at change set creation with "Following
+      # functions are not supported in the Rules block". Fn::Contains asserting
+      # that no element is blank is how an unset list is caught here.
+      - Assert:
+          Fn::Not:
+            - Fn::Contains:
+                - !Ref DatabaseSubnetListParameter
+                - ""
         AssertDescription: >
           DatabaseSubnetListParameter is required when CreateNetworkParameter is No.
-      - Assert: !Not [!Equals [!Join ["", !Ref LambdaSubnetListParameter], ""]]
+      - Assert:
+          Fn::Not:
+            - Fn::Contains:
+                - !Ref LambdaSubnetListParameter
+                - ""
         AssertDescription: >
           LambdaSubnetListParameter is required when CreateNetworkParameter is No.
 
