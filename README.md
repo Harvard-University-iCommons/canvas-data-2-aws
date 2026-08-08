@@ -149,6 +149,77 @@ To set the DAP credentials by hand instead, they are two SecureString parameters
 encrypted with the default `alias/aws/ssm` key — `ListTablesFunction` has parameter read access but
 no KMS permissions, so a customer-managed key breaks it at runtime.
 
+## Connecting to the database
+
+The cluster has no public IP (`PubliclyAccessible: false`), sits in private subnets, and its
+security group accepts PostgreSQL connections only from `DatabaseClientSecurityGroup` — the group
+attached to the Lambda functions. Nothing else can reach it until you arrange it, and how you do
+that depends on how you deployed.
+
+Two credentials exist, both in Secrets Manager:
+
+| Secret | User | For |
+| --- | --- | --- |
+| `cd2-db-user-<environment>-canvas` | `canvas` | Reading the replicated data |
+| The stack's `AdminSecretArn` output | `cd2admin` | Administration |
+
+### Querying without any network access
+
+The RDS Data API is enabled (`EnableHttpEndpoint: true`) — it is how `bootstrap.py` creates the
+database user. It works over HTTPS with IAM authentication, so it needs no network path into the
+VPC at all:
+
+```bash
+aws rds-data execute-statement \
+  --resource-arn <the stack's AuroraClusterArn output> \
+  --secret-arn <the ARN of cd2-db-user-<environment>-canvas> \
+  --database cd2 \
+  --sql 'select count(*) from canvas.users'
+```
+
+This is good for ad-hoc checks and nothing more. Responses are capped at 1 MiB with a 64 KB limit
+per row, it only reaches the writer instance, and it is not a session — no `psql`, no BI tool, no
+transaction spanning calls, no bulk export.
+
+### If the stack created the network
+
+That VPC contains nothing but this application, so you have to add whatever you connect through.
+The usual minimum is a small EC2 instance in one of the private subnets, with
+`DatabaseClientSecurityGroup` attached and an instance profile allowing SSM. Attaching that group
+is the important part — it is what the database's existing ingress rule already trusts, so no
+template change is needed.
+
+From there, either run `psql` and the `dap` CLI on the instance directly, or forward the port to
+your workstation without opening any inbound rules at all:
+
+```bash
+aws ssm start-session --target <instance-id> \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["<cluster endpoint>"],"portNumber":["5432"],"localPortNumber":["5432"]}'
+```
+
+Do not reach for making the cluster publicly accessible instead. Besides being a poor idea for a
+database holding student data, it would not work here without also moving the cluster to the public
+subnets.
+
+### If you deployed into an existing VPC
+
+Your organization most likely already has a route in — Direct Connect, Site-to-Site or Client VPN,
+Transit Gateway, VPC peering, or an existing bastion host. The database is reachable over any of
+them; what this template deliberately does not do is decide who should be allowed. The
+`DatabaseSecurityGroup` carries a `TODO` for exactly this.
+
+Two ways to grant it:
+
+* **Attach `DatabaseClientSecurityGroup` to the client** — an EC2 instance, an ECS task, a
+  container running BI tooling. Requires no template change, because the ingress rule already
+  trusts that group.
+* **Add an ingress rule** to `DatabaseSecurityGroup` allowing the source security group or CIDR
+  range your users connect from.
+
+Prefer a security-group source over a CIDR block where you can: it keeps working when addresses
+change, and it documents *what* is allowed rather than *where from*.
+
 ## Monitoring
 
 Every run publishes a summary to the stack's SNS topic listing which tables completed and which
@@ -163,9 +234,57 @@ function logs to `/aws/lambda/cd2-<environment>-<function>`, both retained for
 
 **Large tables can exceed Lambda's 15-minute limit.** If a table's init or sync does, the workflow
 fails and the error appears in the Step Functions console. That table has to be initialized
-out-of-band with the `dap` CLI.
+out-of-band with the `dap` CLI, after which the workflow picks it up and keeps it current with
+ordinary incremental syncs.
 
-TODO: details on how to initialize a table using the DAP client
+### Initializing a table with the dap CLI
+
+This needs a real connection to the database, so first arrange one — see
+[Connecting to the database](#connecting-to-the-database). The RDS Data API route does not work
+here; the client opens a PostgreSQL session.
+
+Run `bootstrap.py` first if you have not: the CLI needs the database user and the `canvas` and
+`instructure_dap` schemas to already exist.
+
+**1. Install the client** on the machine that will run it, pinned to the same version the Lambda
+functions use — the client migrates its own `instructure_dap` metadata schema on each run, so a
+newer CLI can move the database ahead of what the deployed functions expect:
+
+```bash
+uv tool install 'instructure-dap-client[postgresql]==2.1.0'
+```
+
+**2. Get the database credentials** from the secret the stack created:
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id cd2-db-user-<environment>-canvas \
+  --query SecretString --output text
+```
+
+That returns JSON containing `username`, `password`, `host`, `port` and `dbname`.
+
+**3. Set the environment** — using variables rather than flags keeps the secrets out of your shell
+history:
+
+```bash
+export DAP_CLIENT_ID='<your DAP client ID>'
+export DAP_CLIENT_SECRET='<your DAP client secret>'
+export DAP_CONNECTION_STRING='postgresql://<username>:<password>@<host>:<port>/<dbname>'
+```
+
+**4. Initialize the table:**
+
+```bash
+dap initdb --namespace canvas --table <table name>
+```
+
+`--table` also accepts a comma-separated list, or `all`. The equivalent incremental command is
+`dap syncdb`, though the workflow normally handles that.
+
+The client downloads the snapshot into an `instructure_dap_temp` directory under your current
+working directory before loading it, so run this somewhere with enough free disk for the table —
+this is precisely the constraint that makes the largest tables awkward inside Lambda.
 
 **Schema changes are handled automatically.** The DAP library applies them with `ALTER TABLE`, and
 this application does nothing special to accommodate them. PostgreSQL does refuse to `ALTER TABLE`
