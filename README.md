@@ -36,7 +36,11 @@ This application uses an AWS Step Function to orchestrate the workflow:
 It will be helpful to have a working knowledge of AWS services and the AWS Console. Before you can deploy the application you will need to have the following available:
 * A VPC
 * One or more subnets where the Lambda functions can be deployed
-* One or more subnets where the database cluster can be deployed (can be the same as the Lambda subnets)
+* **At least two subnets, in different Availability Zones**, where the database cluster can be
+  deployed (these can be the same as the Lambda subnets). RDS requires a DB subnet group to cover
+  at least two AZs even though this template creates only a single database instance. If you supply
+  subnets from a single AZ, stack creation fails with `DB Subnet Group doesn't meet availability
+  zone coverage requirement. Please add subnets to cover at least 2 availability zones.`
 * **Outbound internet access from the Lambda subnets** — see below
 
 ### Network access for the Lambda functions
@@ -105,7 +109,6 @@ Beyond the VPC and subnet parameters, the template takes:
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `EngineVersionParameter` | `16.14` | Aurora PostgreSQL engine version (16.3 or later) |
-| `MapMaxConcurrencyParameter` | `10` | How many tables to sync concurrently |
 | `DatabaseMinCapacityParameter` | `0.5` | Minimum Aurora Serverless v2 capacity (ACU) |
 | `DatabaseMaxCapacityParameter` | `4` | Maximum Aurora Serverless v2 capacity (ACU) |
 | `LogRetentionInDaysParameter` | `30` | CloudWatch log retention |
@@ -125,19 +128,30 @@ aws rds describe-db-engine-versions --engine aurora-postgresql \
 
 **Concurrency and database capacity are linked.** Each concurrent table sync opens its own
 connection, and Aurora Serverless v2 scales `max_connections` with ACU capacity. The defaults are
-deliberately conservative because the first run is the heaviest — every table needs to be
-initialized at once against a cluster sitting at its minimum capacity. If you see connection
-errors, either lower `MapMaxConcurrencyParameter` or raise `DatabaseMinCapacityParameter`. Note
-that raising the minimum capacity raises your continuous cost, since it is the floor you pay for
-whether or not the workflow is running.
+conservative because the first run is the heaviest — every table needs to be initialized at once
+against a cluster sitting at its minimum capacity. If you see connection errors, either raise
+`DatabaseMinCapacityParameter` or lower the Map state's `MaxConcurrency` (currently `10`) in
+`template.yaml`. Note that raising the minimum capacity raises your continuous cost, since it is
+the floor you pay for whether or not the workflow is running.
+
+`MaxConcurrency` is a literal in the template rather than a stack parameter because CloudFormation
+resolves intrinsic functions inside an inline state machine definition to strings, and the Amazon
+States Language requires an integer there.
 
 ## Preparing the database
 
 Deploying this application will create an AWS Aurora Postgres cluster. A database user credential is also created and stored in AWS Secrets Manager. In order for the application to use that credential to connect to the database,
 a Postgresql user must be created and granted appropriate privileges. A helper script is included that will take care of this setup. After deploying the SAM app, run this script:
 ```
-./prepare_aurora_db.py --stack-name <stack name returned by the SAM deployment>
+uv run prepare_aurora_db.py --stack-name <stack name returned by the SAM deployment>
 ```
+The script's dependencies are declared in `pyproject.toml`, so [uv](https://docs.astral.sh/uv/)
+installs them into a local environment on first run. If you would rather manage the environment
+yourself, `pip install boto3 rich` and run `./prepare_aurora_db.py` directly.
+
+It connects through the RDS Data API rather than a direct database connection, so it can be run
+from outside the VPC — but the cluster must have `EnableHttpEndpoint` set, which this template does
+by default.
 Occasionally the schema for a CD2 table will change. The DAP library applies these changes automatically with `ALTER TABLE`, and this application does nothing special to accommodate them.
 
 Note that PostgreSQL refuses to `ALTER TABLE` while a view depends on the table. This application creates no views, so it should not come up — but if you add your own views over the replicated tables, a CD2 schema change will start failing. `sync_table` reports that case as `needs_ddl_update` and the table is listed under `failed_ddl_update` in the SNS notification; you would need to drop the dependent views and re-run the workflow. If you want that handled automatically, the `deps_save_and_drop_dependencies` / `deps_restore_dependencies` functions from https://github.com/rvkulikov/pg-deps-management are one way to do it.
@@ -232,7 +246,7 @@ with real data, consider:
   submissions-related ones are the usual culprits — can exceed it, in which case that table needs to
   be initialized out-of-band with the `dap` CLI. This is the most likely reason to outgrow this
   architecture entirely and move the work to ECS or Batch.
-* **`MapMaxConcurrencyParameter` and `DatabaseMinCapacityParameter` are coupled.** See *Template
+* **The Map state's `MaxConcurrency` and `DatabaseMinCapacityParameter` are coupled.** See *Template
   parameters*.
 * **Function memory** (`MemorySize`) was chosen by rough estimate, not measurement. Init runs at
   8192 MB largely to get proportional CPU. Measure before assuming these are right for your data.
