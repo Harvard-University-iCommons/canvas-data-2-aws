@@ -62,22 +62,265 @@ Parameters:
     Default: 4
     Description: Maximum Aurora Serverless v2 capacity (ACU).
 
+  CreateNetworkParameter:
+    Type: String
+    Default: "No"
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Description: >
+      Whether to create a VPC, subnets and a NAT gateway for this stack. Set this
+      to Yes to deploy with no networking prerequisites, and leave the three
+      parameters below blank. Note that the NAT gateway is billed hourly whether
+      or not the workflow is running; deleting the stack stops that charge.
+      Set this to No to deploy into a VPC you already have.
+
+  VpcCidrParameter:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: >
+      CIDR block for the created VPC. Only used when CreateNetworkParameter is
+      Yes. Subnet ranges are derived from this, so it can be changed to avoid
+      collisions without editing the subnets individually.
+
+  # The three parameters below are plain strings rather than AWS::EC2::VPC::Id and
+  # List<AWS::EC2::Subnet::Id>. Those types exist to reference resources that already
+  # exist and reject an empty value, which would make them impossible to leave blank
+  # when CreateNetworkParameter is Yes. The Rules section below restores the check
+  # that matters: that they are actually supplied when the network is not being created.
   VpcIdParameter:
-    Type: AWS::EC2::VPC::Id
-    Description: The ID of the VPC to deploy the database and Lambda functions into.
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^vpc-(([0-9A-Fa-f]{8})|([0-9A-Fa-f]{17}))$"
+    ConstraintDescription: must be blank or a VPC ID such as vpc-0123456789abcdef0
+    Description: >
+      The ID of the VPC to deploy the database and Lambda functions into. Required
+      when CreateNetworkParameter is No; leave blank otherwise.
 
   DatabaseSubnetListParameter:
-    Type: List<AWS::EC2::Subnet::Id>
+    Type: CommaDelimitedList
+    Default: ""
+    # For a CommaDelimitedList, CloudFormation splits on commas first and applies this
+    # pattern to each element, so the regex never sees a comma. Surrounding whitespace
+    # is tolerated because "subnet-a, subnet-b" is a natural way to write the list.
+    AllowedPattern: '^$|^\s*subnet-(([0-9A-Fa-f]{8})|([0-9A-Fa-f]{17}))\s*$'
+    ConstraintDescription: must be blank or a comma-separated list of subnet IDs
     Description: >
       The subnets to deploy the database into. RDS requires at least two, in
       different Availability Zones, even though this template creates only a
-      single database instance.
+      single database instance. Required when CreateNetworkParameter is No;
+      leave blank otherwise.
 
   LambdaSubnetListParameter:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: The list of one or more subnets to deploy the Lambda functions into.
+    Type: CommaDelimitedList
+    Default: ""
+    # For a CommaDelimitedList, CloudFormation splits on commas first and applies this
+    # pattern to each element, so the regex never sees a comma. Surrounding whitespace
+    # is tolerated because "subnet-a, subnet-b" is a natural way to write the list.
+    AllowedPattern: '^$|^\s*subnet-(([0-9A-Fa-f]{8})|([0-9A-Fa-f]{17}))\s*$'
+    ConstraintDescription: must be blank or a comma-separated list of subnet IDs
+    Description: >
+      The list of one or more subnets to deploy the Lambda functions into.
+      Required when CreateNetworkParameter is No; leave blank otherwise.
+
+Conditions:
+  CreateNetwork: !Equals [!Ref CreateNetworkParameter, "Yes"]
+
+Rules:
+  # Without this, omitting the VPC parameters fails partway through resource
+  # creation with an opaque error instead of at parameter validation.
+  NetworkRequiredWhenNotCreated:
+    RuleCondition: !Equals [!Ref CreateNetworkParameter, "No"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VpcIdParameter, ""]]
+        AssertDescription: >
+          VpcIdParameter is required when CreateNetworkParameter is No. Set
+          CreateNetworkParameter to Yes to have the stack create its own network.
+      - Assert: !Not [!Equals [!Join ["", !Ref DatabaseSubnetListParameter], ""]]
+        AssertDescription: >
+          DatabaseSubnetListParameter is required when CreateNetworkParameter is No.
+      - Assert: !Not [!Equals [!Join ["", !Ref LambdaSubnetListParameter], ""]]
+        AssertDescription: >
+          LambdaSubnetListParameter is required when CreateNetworkParameter is No.
 
 Resources:
+
+  # ---------------------------------------------------------------------------
+  # Optional network. Everything in this block is created only when
+  # CreateNetworkParameter is Yes, so that the stack can be deployed with no
+  # networking prerequisites.
+  #
+  # Two Availability Zones, because an RDS DB subnet group must cover at least
+  # two even though this template creates a single database instance.
+  #
+  # The Lambda functions need outbound internet access to reach the DAP API, and
+  # a VPC-attached Lambda has none by default. Lambda ENIs never receive public
+  # IP addresses, so putting the functions in the public subnets would not help,
+  # and no VPC endpoint can reach a third-party endpoint. That makes the NAT
+  # gateway a requirement rather than a convenience.
+  # ---------------------------------------------------------------------------
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: !Ref VpcCidrParameter
+      # Both are required for the RDS cluster endpoint to resolve from inside the VPC.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnet ranges are carved out of the VPC CIDR rather than hardcoded, so that
+  # changing VpcCidrParameter does not require editing each subnet. With the
+  # default /16 this yields four /24s: 10.0.0.0, 10.0.1.0, 10.0.2.0, 10.0.3.0.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidrParameter, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidrParameter, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-public-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidrParameter, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidrParameter, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-private-2
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateNetwork
+    Properties:
+      Domain: vpc
+
+  # A single NAT gateway serves both private subnets. One per AZ would remove this
+  # as a single point of failure and avoid cross-AZ data charges, at roughly double
+  # the fixed cost.
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNetwork
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-nat
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    # The route cannot be created until the gateway is actually attached to the
+    # VPC, and CloudFormation does not infer that ordering from the properties.
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub cd2-${EnvironmentParameter}-private-rt
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Application resources
+  # ---------------------------------------------------------------------------
 
   KmsKey:
     Type: AWS::KMS::Key
@@ -102,25 +345,45 @@ Resources:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupDescription: !Sub cd2-subnetgroup-${EnvironmentParameter}
-      SubnetIds: !Ref DatabaseSubnetListParameter
+      SubnetIds: !If
+        - CreateNetwork
+        - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        - !Ref DatabaseSubnetListParameter
 
+  # W1030 is suppressed on the three security groups below. cfn-lint checks that a
+  # VpcId looks like a VPC ID, and cannot tell that the !Ref VpcIdParameter branch
+  # is unreachable when CreateNetwork is true -- so it flags the empty default that
+  # exists precisely so the parameter can be left blank in that case. The
+  # AllowedPattern on VpcIdParameter enforces the format when a value is supplied.
   DatabaseClientSecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
     Properties:
       GroupDescription: !Sub cd2-database-client-sg-${EnvironmentParameter}
-      VpcId: !Ref VpcIdParameter
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcIdParameter]
 
   EmptySecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
     Properties:
       GroupDescription: !Sub cd2-empty-sg-${EnvironmentParameter}
-      VpcId: !Ref VpcIdParameter
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcIdParameter]
 
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
     Properties:
       GroupDescription: !Sub cd2-database-sg-${EnvironmentParameter}
-      VpcId: !Ref VpcIdParameter
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcIdParameter]
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 5432
@@ -227,7 +490,10 @@ Resources:
       VpcConfig:
         SecurityGroupIds:
           - !Ref EmptySecurityGroup
-        SubnetIds: !Ref LambdaSubnetListParameter
+        SubnetIds: !If
+          - CreateNetwork
+          - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          - !Ref LambdaSubnetListParameter
 
   SyncTableFunction:
     Type: AWS::Serverless::Function
@@ -262,7 +528,10 @@ Resources:
       VpcConfig:
         SecurityGroupIds:
           - !Ref DatabaseClientSecurityGroup
-        SubnetIds: !Ref LambdaSubnetListParameter
+        SubnetIds: !If
+          - CreateNetwork
+          - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          - !Ref LambdaSubnetListParameter
 
   InitTableFunction:
     Type: AWS::Serverless::Function
@@ -297,7 +566,10 @@ Resources:
       VpcConfig:
         SecurityGroupIds:
           - !Ref DatabaseClientSecurityGroup
-        SubnetIds: !Ref LambdaSubnetListParameter
+        SubnetIds: !If
+          - CreateNetwork
+          - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          - !Ref LambdaSubnetListParameter
 
   WorkflowNotificationTopic:
     Type: AWS::SNS::Topic
@@ -542,6 +814,18 @@ Resources:
         - !Ref WorkflowNotificationTopic
 
 Outputs:
+  VpcId:
+    Condition: CreateNetwork
+    Value: !Ref Vpc
+    Description: The ID of the VPC created by this stack
+  PrivateSubnetIds:
+    Condition: CreateNetwork
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Description: The private subnets holding the database and the Lambda functions
+  PublicSubnetIds:
+    Condition: CreateNetwork
+    Value: !Join [",", [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Description: The public subnets holding the NAT gateway
   AdminSecretArn:
     Value: !GetAtt AuroraDatabaseCluster.MasterUserSecret.SecretArn
     Description: The ARN of the Aurora admin user secret

@@ -7,6 +7,7 @@ You can deploy this application to your AWS account with the SAM CLI. It include
 - `sync_table` - Code for a Lambda function that syncs a table using the `dap` client library.
 - `init_table` - Code for a Lambda function that inits a table using the `dap` client library.
 - `template.yaml` - A template that defines the application's AWS resources.
+- `bootstrap.py` - A helper script that prepares a deployed stack: stores the DAP API credentials and creates the database user and schemas.
 
 This application targets version 2.x of the `instructure-dap-client` library. Version 2 changed the
 client API in ways that are not backward compatible with 1.x, so the Lambda functions here follow the
@@ -33,7 +34,16 @@ This application uses an AWS Step Function to orchestrate the workflow:
 
 ## Prerequisites
 
-It will be helpful to have a working knowledge of AWS services and the AWS Console. Before you can deploy the application you will need to have the following available:
+It will be helpful to have a working knowledge of AWS services and the AWS Console.
+
+**If you just want to try this out**, set `CreateNetworkParameter` to `Yes` and the stack will build
+its own VPC, subnets and NAT gateway. You then need none of the networking below — skip to
+[Deploying the application](#deploying-the-application). Be aware that the NAT gateway is billed by
+the hour whether or not the workflow is running (currently about $33/month in `us-east-1`, plus
+$0.045/GB); deleting the stack stops that charge.
+
+Otherwise, to deploy into a VPC you already have (`CreateNetworkParameter` left at its `No`
+default), you will need:
 * A VPC
 * One or more subnets where the Lambda functions can be deployed
 * **At least two subnets, in different Availability Zones**, where the database cluster can be
@@ -71,8 +81,18 @@ The Serverless Application Model Command Line Interface (SAM CLI) is an extensio
 To use the SAM CLI to deploy this application, you need the following tools.
 
 * SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
-* [Python 3 installed](https://www.python.org/downloads/)
+* [uv](https://docs.astral.sh/uv/getting-started/installation/) - manages the local Python environment
 * [Docker](https://docs.docker.com/get-docker/) - required, see below
+
+You do not need to install Python yourself; uv downloads a suitable version if you don't already
+have one. Create the local environment with:
+
+```bash
+uv sync
+```
+
+That environment is used by the `bootstrap.py` helper script. The Lambda functions do not
+use it — `sam build` installs each function's own `requirements.txt` inside a container.
 
 Docker is required because these functions depend on packages with compiled C extensions
 (`asyncpg`, `tsv2py`, `aiohttp`). A plain `sam build` installs wheels built for *your* machine,
@@ -108,6 +128,8 @@ Beyond the VPC and subnet parameters, the template takes:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
+| `CreateNetworkParameter` | `No` | Create a VPC, subnets and NAT gateway for this stack |
+| `VpcCidrParameter` | `10.0.0.0/16` | CIDR for the created VPC (ignored unless creating one) |
 | `EngineVersionParameter` | `16.14` | Aurora PostgreSQL engine version (16.3 or later) |
 | `DatabaseMinCapacityParameter` | `0.5` | Minimum Aurora Serverless v2 capacity (ACU) |
 | `DatabaseMaxCapacityParameter` | `4` | Maximum Aurora Serverless v2 capacity (ACU) |
@@ -138,20 +160,64 @@ the floor you pay for whether or not the workflow is running.
 resolves intrinsic functions inside an inline state machine definition to strings, and the Amazon
 States Language requires an integer there.
 
-## Preparing the database
+### Letting the stack create the network
 
-Deploying this application will create an AWS Aurora Postgres cluster. A database user credential is also created and stored in AWS Secrets Manager. In order for the application to use that credential to connect to the database,
-a Postgresql user must be created and granted appropriate privileges. A helper script is included that will take care of this setup. After deploying the SAM app, run this script:
-```
-uv run prepare_aurora_db.py --stack-name <stack name returned by the SAM deployment>
-```
-The script's dependencies are declared in `pyproject.toml`, so [uv](https://docs.astral.sh/uv/)
-installs them into a local environment on first run. If you would rather manage the environment
-yourself, `pip install boto3 rich` and run `./prepare_aurora_db.py` directly.
+With `CreateNetworkParameter=Yes`, leave `VpcIdParameter`, `DatabaseSubnetListParameter` and
+`LambdaSubnetListParameter` blank and the stack creates:
 
-It connects through the RDS Data API rather than a direct database connection, so it can be run
-from outside the VPC — but the cluster must have `EnableHttpEndpoint` set, which this template does
-by default.
+```
+VPC 10.0.0.0/16
+├── public subnet  (AZ a) ── NAT gateway + Elastic IP
+├── public subnet  (AZ b)
+├── private subnet (AZ a) ── Lambda functions + database
+└── private subnet (AZ b) ── Lambda functions + database
+```
+
+Two Availability Zones, because that is the RDS DB subnet group minimum. Both private subnets route
+outbound traffic through the single NAT gateway; a production deployment would usually use one per
+AZ so that losing an AZ does not stop the workflow. Subnet ranges are derived from
+`VpcCidrParameter`, so changing it is enough to avoid a collision with an existing network.
+
+The created VPC and subnet IDs are stack outputs, so you can find them without hunting through the
+console.
+
+Deploying into an existing VPC instead is the default; those three parameters are then required, and
+the stack fails immediately with a message naming the missing one rather than partway through
+creating resources.
+
+## Preparing the stack
+
+Two things have to happen after `sam deploy` before the workflow can run: the DAP API credentials
+need to be stored, and the database user the Lambda functions connect as needs to be created.
+`bootstrap.py` does both:
+
+```
+uv run bootstrap.py --stack-name <stack name returned by the SAM deployment>
+```
+
+It prompts for the DAP client ID and secret (the secret is hidden as you type), then creates the
+database user, its schema, and the `instructure_dap` schema the DAP client keeps its metadata in.
+Both halves are idempotent, so re-running is safe: credentials that are already stored are left
+alone unless you pass `--update-credentials`, and an existing database user has its password reset
+to match the secret.
+
+Useful flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--update-credentials` | Replace DAP credentials that are already stored |
+| `--dap-client-id`, `--dap-client-secret` | Supply credentials non-interactively instead of being prompted |
+| `--skip-credentials` | Only prepare the database |
+| `--skip-database` | Only store the credentials |
+
+This uses the environment created by `uv sync` above; `uv run` will also create it on the spot if
+you skipped that step. The script needs permission to read the stack, read and write the
+`/<environment>/canvas_data_2` SSM parameters, read the stack's secrets, and call the RDS Data API.
+
+The database half connects through the RDS Data API rather than a direct database connection, so it
+can be run from outside the VPC — but the cluster must have `EnableHttpEndpoint` set, which this
+template does by default.
+
 Occasionally the schema for a CD2 table will change. The DAP library applies these changes automatically with `ALTER TABLE`, and this application does nothing special to accommodate them.
 
 Note that PostgreSQL refuses to `ALTER TABLE` while a view depends on the table. This application creates no views, so it should not come up — but if you add your own views over the replicated tables, a CD2 schema change will start failing. `sync_table` reports that case as `needs_ddl_update` and the table is listed under `failed_ddl_update` in the SNS notification; you would need to drop the dependent views and re-run the workflow. If you want that handled automatically, the `deps_save_and_drop_dependencies` / `deps_restore_dependencies` functions from https://github.com/rvkulikov/pg-deps-management are one way to do it.
@@ -174,13 +240,23 @@ the state machine.
 ## Configuration
 
 In order for the application to use the DAP API, you will need to provide a client ID and secret.
+These are stored as SecureString parameters in AWS SSM Parameter Store and read by the Lambda
+functions at runtime. `bootstrap.py` stores them for you — see *Preparing the stack* above — and
+prompts for the secret with the input hidden so that it does not end up in your shell history.
 
-The application uses AWS SSM Param Store to securely these values and retrieve them at runtime. To store your client ID and secret:
+To replace credentials that are already stored:
+```
+uv run bootstrap.py --stack-name <stack name> --update-credentials
+```
+
+If you would rather set them by hand, they are two parameters under `/<environment>/canvas_data_2`,
+where `<environment>` matches the stack's `EnvironmentParameter`:
 ```
 aws ssm put-parameter --name '/<environment>/canvas_data_2/dap_client_id' --type SecureString --value '<your client ID>'
 aws ssm put-parameter --name '/<environment>/canvas_data_2/dap_client_secret' --type SecureString --value '<your client secret>'
 ```
-where `<environment>` is either `dev` or `prod`. You can also use the AWS SSM console to manage the parameter.
+Leave them encrypted with the default `alias/aws/ssm` key. `ListTablesFunction` is granted parameter
+read access but no KMS permissions, so a customer-managed key would break it at runtime.
 
 ## Running the application
 
@@ -202,7 +278,7 @@ the ones most likely to need attention, roughly in the order they tend to matter
   credentials from a fixed SSM path and replicate the `canvas` namespace into a single database.
   Replicating multiple Canvas instances, or several tenants into separate schemas, means threading
   a database/tenant identifier through the Step Function payload and the SSM parameter paths.
-* **No views over the replicated tables.** See the note under *Preparing the database* — adding your
+* **No views over the replicated tables.** See the note under *Preparing the stack* — adding your
   own views changes how CD2 schema changes behave.
 * **Two environments, `dev` and `prod`,** defined in `samconfig.toml` and enforced by
   `EnvironmentParameter`'s allowed values. Add more there if you need them.
@@ -226,7 +302,7 @@ with real data, consider:
   proof-of-concept and wrong for anything you care about. Note that `AWS::RDS::DBCluster` defaults
   to `DeletionPolicy: Snapshot`, so a stack deletion does leave a final snapshot behind.
 * **Secrets are never rotated.** The database user credential is generated once at deploy time.
-* **The RDS Data API is enabled** (`EnableHttpEndpoint: true`) because `prepare_aurora_db.py` uses
+* **The RDS Data API is enabled** (`EnableHttpEndpoint: true`) because `bootstrap.py` uses
   it to create the database user. It is IAM-gated, but it is an additional path to the database. If
   you provision the database user some other way, you can turn it off.
 
@@ -272,3 +348,8 @@ aws cloudformation delete-stack --stack-name canvas-data-2
 ```
 
 Alternatively, you can delete the stack in the CloudFormation console (within the AWS web console).
+
+If you deployed with `CreateNetworkParameter=Yes`, deleting the stack also removes the NAT gateway
+and releases its Elastic IP, which is what stops the hourly charge. Note that the database cluster
+is left behind as a final snapshot — `AWS::RDS::DBCluster` defaults to `DeletionPolicy: Snapshot` —
+so delete that snapshot too if you do not want to keep paying for its storage.
