@@ -247,4 +247,4 @@ $RECYCLE.BIN/
 # AWS SAM
 .aws-sam
 
- *.bak
+*.bak
