@@ -50,18 +50,6 @@ Parameters:
       expiring, which accumulates cost indefinitely for a workflow that runs
       every few hours across many tables.
 
-  MapMaxConcurrencyParameter:
-    Type: Number
-    Default: 10
-    MinValue: 1
-    MaxValue: 100
-    Description: >
-      How many tables to sync concurrently. Each concurrent iteration opens its
-      own connection to the database, and Aurora Serverless v2 scales
-      max_connections with ACU capacity. Raising this without also raising
-      DatabaseMinCapacityParameter risks connection errors, which are most
-      likely on the first run when every table needs to be initialized.
-
   DatabaseMinCapacityParameter:
     Type: Number
     Default: 0.5
@@ -80,7 +68,10 @@ Parameters:
 
   DatabaseSubnetListParameter:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: The list of one or more subnets to deploy the database into.
+    Description: >
+      The subnets to deploy the database into. RDS requires at least two, in
+      different Availability Zones, even though this template creates only a
+      single database instance.
 
   LambdaSubnetListParameter:
     Type: List<AWS::EC2::Subnet::Id>
@@ -421,7 +412,19 @@ Resources:
             Next: ProcessTables
           ProcessTables:
             Type: Map
-            MaxConcurrency: !Ref MapMaxConcurrencyParameter
+            # Must be a literal integer. CloudFormation resolves intrinsics inside
+            # an inline state machine definition to strings, and ASL requires an
+            # integer here, so !Ref to a Number parameter fails deployment with
+            # "SCHEMA_VALIDATION_FAILED: Expected value of type Integer at
+            # /States/ProcessTables/MaxConcurrency". To make this configurable
+            # without editing the template, use MaxConcurrencyPath and supply the
+            # value in the state input instead.
+            #
+            # Each concurrent iteration opens its own database connection, and
+            # Aurora Serverless v2 scales max_connections with ACU capacity, so
+            # raising this may also require raising DatabaseMinCapacityParameter.
+            # The first run is the heaviest: every table needs initializing at once.
+            MaxConcurrency: 10
             ItemsPath: "$.tables"
             Next: PivotResults
             ItemProcessor:
